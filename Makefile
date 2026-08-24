@@ -19,6 +19,13 @@ help: ## List the targets
 test: ## Run the suite (needs `make pg-up`, or a PGNOTCH_DSN of your own)
 	PGNOTCH_DSN='$(PGNOTCH_DSN)' go test ./... -count=1 -timeout 10m
 
+# The load generator, on the same database and by the same variable. Its own
+# flags go in ARGS, since what a run should ask of the database is the whole of
+# what it is for: `make load ARGS='-rps 500 -logs 8 -sizes 1k:9,32k:1'`.
+.PHONY: load
+load: ## Put an append load on logs of its own (ARGS='-rps 500 -logs 8')
+	PGNOTCH_DSN='$(PGNOTCH_DSN)' go run ./cmd/pgnotch-load $(ARGS)
+
 .PHONY: pg-up
 pg-up: ## Start a PostgreSQL for the suite
 	@PG_PORT=$(PG_PORT) PG_USER=$(PG_USER) PG_PASSWORD=$(PG_PASSWORD) \
