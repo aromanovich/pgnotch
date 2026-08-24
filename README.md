@@ -48,9 +48,17 @@ if err := store.Fence(ctx, shipments, epoch); err != nil {
     return err
 }
 
+// Ask the log where it ended. The log you have just fenced may be one somebody
+// else was writing, and this is what hands its mark over — the entry rows are
+// not where the mark is kept, so it is right even for a log a trim has emptied.
+next, err := store.NextSeqno(ctx, shipments)
+if err != nil {
+    return err
+}
+
 // Append at consecutive seqnos. Returning nil means every entry up to the
 // batch's last is durable.
-err = store.Append(ctx, shipments, epoch, pgnotch.FirstSeqno, [][]byte{
+err = store.Append(ctx, shipments, epoch, next, [][]byte{
     []byte("first"),
     []byte("second"),
 })
@@ -66,8 +74,9 @@ case err != nil:
 
 // The next batch starts where this one ended: seqnos are always the caller's
 // to assign, and there is no "append at the end". The owner keeps its own
-// high-water mark; the three outcomes above are this call's as well.
-err = store.Append(ctx, shipments, epoch, pgnotch.FirstSeqno+2, [][]byte{
+// high-water mark from here and does not ask again; the three outcomes above
+// are this call's as well.
+err = store.Append(ctx, shipments, epoch, next+2, [][]byte{
     []byte("third"),
 })
 
