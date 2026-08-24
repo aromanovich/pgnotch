@@ -328,6 +328,62 @@ implementation on purpose and watching them go red. They are the reason this
 package is worth having over any other way of putting a log in a table, so a
 change that makes either of them fail is a change to what this package is.
 
+## Putting load on it
+
+`cmd/pgnotch-load` is a load generator: it takes everything from its flags,
+appends at the rate they name until it is interrupted, and prints what the
+window did.
+
+```sh
+make load ARGS='-rps 500 -logs 8 -sizes 1k:9,32k:1'
+# or, pointed anywhere yourself
+go run ./cmd/pgnotch-load -dsn postgres://user:password@localhost:5432/db -rps 500
+```
+
+```
+8 logs at epoch 1787607891, 500 appends/s × 1 entries = 500 entries/s, ~2.0 MiB/s
+sizes 1.0 KiB×9 32.0 KiB×1, mean 4.1 KiB, 10% over the 8000-byte chunk
+each log keeps 100000 entries, trimmed every 12500
+[    5s]     2500 appends    500.0/s |     2500 entries |  10.1 MiB   2.0 MiB/s |     3480 rows    250 cut | p50  319µs p99  639µs max  1.5ms
+```
+
+The distribution is the point of the tool. `-sizes` takes `size:weight` classes
+— `1k:9,32k:1` is one entry in ten at 32 KiB — and a class over `MaxEntryChunk`
+is an entry the library has to cut into several rows, which is a different write
+from a 900-byte one and is not exercised by a single size. `rows` and `cut` on
+the report line are how much of that the window actually did.
+
+| flag | |
+|---|---|
+| `-rps` | appends a second over all logs together |
+| `-logs` | logs, which is also the number of concurrent writers: one log admits one |
+| `-batch` | entries per append |
+| `-sizes` | the payload-size distribution, `size:weight` with `k` and `m` suffixes |
+| `-retain` | entries a log keeps before the writer trims behind itself; `0` never trims |
+| `-duration` | how long to run; `0` runs until `SIGINT` |
+| `-schema` | the schema to put the logs in, created if missing |
+
+Three things follow from what a log is, rather than from the tool:
+
+* **it owns the logs it writes.** They are created under `-prefix`, fenced at an
+  epoch of the run's own — Unix seconds unless you pass `-epoch` — and a run
+  that finds one taken by a higher epoch stops with `ErrFenced` rather than
+  fencing it back, because a second generator racing the first would be
+  measuring the race;
+* **it trims behind itself**, which is what makes an unbounded run cost a
+  bounded amount of disk. `-retain 0` turns that off and the tables then grow
+  for as long as it runs;
+* **it picks up where it left off.** A restart reads each log for its mark the
+  way any new owner has to, and says which seqno it continues at.
+
+The rate is a schedule fixed when the run starts, not a sleep between appends,
+so a slow round trip is repaid out of the slots after it rather than lowering
+the rate quietly. When it cannot be repaid the slots are abandoned and counted
+as `skipped`: a run that could not keep the rate you asked for says so on the
+line, and so does a run whose appends are failing — the count and the last
+error, since a load generator writing nothing looks exactly like one writing
+everything.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
