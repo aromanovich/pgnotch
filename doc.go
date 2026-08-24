@@ -5,8 +5,7 @@
 // chooses, created by [Store.CreateLogs] and never as a side effect. One writer
 // owns it at a time, at an epoch [Store.Fence] takes, so a writer that has lost
 // its log finds out at its next append. The owner assigns seqnos itself, which
-// lets an append be a single statement, and a new owner asks [Store.NextSeqno]
-// where the log it has just taken ended.
+// lets an append be a single statement.
 //
 // # What a caller may rely on
 //
@@ -19,6 +18,8 @@
 //     lower end, an append its upper end, and nothing puts a hole between.
 //  5. Readback. [Store.ReadFrom] returns every entry a completed append acked
 //     and no trim has removed, in seqno order, across a change of owner.
+//  6. Handover. [Store.NextSeqno] names the seqno a new owner's first append
+//     must start at, for a log whose entries a trim has all taken included.
 //
 // Payloads are opaque bytes; nothing here interprets or frames them.
 //

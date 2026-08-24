@@ -399,20 +399,16 @@ func (s *Store) ReadFrom(ctx context.Context, id LogID, from Seqno, limit int) (
 
 // NextSeqno is the seqno the log's next append must start at: one past its last
 // entry, and [FirstSeqno] for a log nothing has appended to. A log that does not
-// exist is [ErrNoSuchLog].
+// exist is [ErrNoSuchLog]. It is the registry row's and is not derived from the
+// entries, so it is right for a log a trim has emptied.
 //
-// It is what a writer that has just fenced a log somebody else wrote needs and
-// does not have. Reading the log for it works and is what a caller had to do
-// before this existed, but it costs a round trip per page and the entry tables
-// carry no index; this is one row, found by primary key, and it is right for a
-// log whose entries a trim has all taken — which a read cannot be, there being
-// nothing left to read.
+// A new owner asks once and keeps the mark itself from there: the log's end
+// after an [Store.Append] is that batch's last seqno, and asking again per
+// append would put a second round trip on the one call that has only one.
 //
-// The value is the caller's to append at only while it owns the log: an append
-// by a higher epoch moves it. That is not a race to lose, because it is not the
-// mark that keeps two writers apart — an append at a stale seqno is refused
-// ([ErrAlreadyWritten], [ErrGap]) rather than misplaced, and one from a fenced-
-// out epoch is refused whatever seqno it names.
+// It answers for the log only while the caller owns it — an append by a higher
+// epoch moves it — which is not a race to lose: appending at a stale value is
+// refused rather than misplaced.
 func (s *Store) NextSeqno(ctx context.Context, id LogID) (Seqno, error) {
 	if err := checkLogID(id); err != nil {
 		return 0, err
@@ -422,7 +418,7 @@ func (s *Store) NextSeqno(ctx context.Context, id LogID) (Seqno, error) {
 		return 0, err
 	}
 	if !found {
-		return 0, fmt.Errorf("pgnotch: the next seqno of %q: %w", id, ErrNoSuchLog)
+		return 0, fmt.Errorf("%w: %q", ErrNoSuchLog, id)
 	}
 	return st.lastSeqno + 1, nil
 }
@@ -476,7 +472,7 @@ func (s *Store) readState(ctx context.Context, id LogID) (logState, bool, error)
 		return logState{}, false, fmt.Errorf("pgnotch: reading the state of %q: %w", id, err)
 	}
 	// The ordinal is here and immutable, so a writer that has just fenced and
-	// read to the tail pays no lookup for its first append.
+	// asked where the log ends pays no lookup for its first append.
 	s.remember(id, st.ordinal)
 	return st, true, nil
 }

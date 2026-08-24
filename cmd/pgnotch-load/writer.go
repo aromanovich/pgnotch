@@ -24,8 +24,8 @@ type writer struct {
 
 	id    pgnotch.LogID
 	epoch pgnotch.Epoch
-	// next is where this writer's next batch starts: its own high-water mark,
-	// which nothing hands over and every owner keeps for itself.
+	// next is where this writer's next batch starts: the mark it took from the
+	// log on claiming it and has kept for itself since.
 	next pgnotch.Seqno
 	// trimmed is the seqno the last trim asked for, so the trims are one per
 	// stride rather than one per append.
@@ -44,9 +44,7 @@ func (w *writer) claim(ctx context.Context) error {
 	return w.locate(ctx)
 }
 
-// locate puts the writer where the log says its next append goes. It is the
-// whole of what a new owner needs and the answer to either refusal alike, since
-// the log's own mark is above a stale position and below one that ran ahead.
+// locate puts the writer where the log says its next append goes.
 func (w *writer) locate(ctx context.Context) error {
 	readCtx, cancel := context.WithTimeout(ctx, w.cfg.timeout)
 	defer cancel()
@@ -131,9 +129,8 @@ func (w *writer) append(ctx context.Context, batch [][]byte) (done bool, err err
 
 	case errors.Is(err, pgnotch.ErrGap):
 		// Unreachable for a single writer appending in order, so it is read as
-		// a lost position rather than as a race, and answered the same way: a
-		// gap means this writer is above the log's end rather than below it,
-		// and the mark is what says where that end is.
+		// a lost position rather than as a race: this writer is above the
+		// log's end.
 		w.c.gaps.Add(1)
 		w.resync(ctx)
 		return false, nil
@@ -149,9 +146,9 @@ func (w *writer) append(ctx context.Context, batch [][]byte) (done bool, err err
 	}
 }
 
-// resync puts the writer back on the log's own mark. A read that fails leaves
-// the position alone: the batch goes again at the next slot, is refused again,
-// and comes back here — a retry loop paced like every other append.
+// resync is locate for a refused append. A read that fails leaves the position
+// alone: the batch goes again at the next slot, is refused again, and comes
+// back here — a retry loop paced like every other append.
 func (w *writer) resync(ctx context.Context) {
 	if err := w.locate(ctx); err != nil {
 		w.c.note(err)

@@ -48,9 +48,8 @@ if err := store.Fence(ctx, shipments, epoch); err != nil {
     return err
 }
 
-// Ask the log where it ended. The log you have just fenced may be one somebody
-// else was writing, and this is what hands its mark over — the entry rows are
-// not where the mark is kept, so it is right even for a log a trim has emptied.
+// Ask where the next append goes: the log you have just fenced may be one
+// somebody else was writing, and this is what hands that over.
 next, err := store.NextSeqno(ctx, shipments)
 if err != nil {
     return err
@@ -83,13 +82,12 @@ err = store.Append(ctx, shipments, epoch, next+2, [][]byte{
 entries, err := store.ReadFrom(ctx, shipments, pgnotch.FirstSeqno, 100)
 ```
 
-A writer that has just fenced a log somebody else wrote does not have that mark,
-and `NextSeqno` is what hands it over: one registry row by primary key, and the
-seqno the next append must start at. Reading the log for it works too and is
-what a caller had to do before that existed, but it is a round trip per page
-over tables that carry no index, and it cannot answer for a log whose entries a
-trim has all taken — there is nothing left to read, and starting again at the
-first seqno is not where that log goes. A replay after an
+A writer that has just fenced a log somebody else wrote does not have that
+mark, and `NextSeqno` hands over where the next append goes: one registry row
+by primary key. It is kept there rather than derived from the entries, so it is
+right for a log a trim has emptied — where reading the log for it would find
+nothing and start again at the first seqno. Ask once on taking the log and
+track it from there; an append does not need to ask. A replay after an
 ambiguous append is the other case that looks like a new seqno and is not —
 resend *the same* batch at the same seqno and read `ErrAlreadyWritten` as the
 ack.
@@ -111,6 +109,8 @@ arrived there) and [`pgx/v5`](https://github.com/jackc/pgx).
    in the middle.
 5. **Readback.** `ReadFrom` returns every entry a completed append acked and no
    trim has removed, in seqno order — across a change of owner included.
+6. **Handover.** `NextSeqno` names the seqno a new owner's first append must
+   start at — for a log whose entries a trim has all taken included.
 
 Payloads are opaque bytes. Nothing here interprets, compresses or frames them,
 and nothing here decides what a log is *for*.
