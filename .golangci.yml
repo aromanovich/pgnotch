@@ -1,0 +1,108 @@
+version: "2"
+
+# What is enabled is what is green over the whole package. A linter that ships
+# red is a linter everybody learns to ignore, so anything whose findings this
+# package decided against is switched off here, with the reason, rather than
+# silenced one `//nolint` at a time.
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    # The idiom half, one linter per family:
+    - errorlint # a type switch or == on an error cannot see a wrapped one
+    - gocritic # the shadowed builtin, the init clause that tests nothing
+    - revive # the exported/return/naming rules of Go Code Review Comments
+    - intrange # for i := 0; i < n; i++
+    - copyloopvar # the pre-1.22 `x := x`
+    - usestdlibvars
+    - wastedassign
+    - makezero
+    - durationcheck
+    - iface
+
+  settings:
+    revive:
+      enable-all-rules: false
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: errorf
+        - name: increment-decrement
+        - name: indent-error-flow
+        - name: range
+        - name: receiver-naming
+        - name: time-naming
+        - name: unexported-return
+        - name: var-declaration
+        - name: superfluous-else
+        - name: unreachable-code
+        - name: redefines-builtin-id
+        - name: bool-literal-in-expr
+        - name: identical-branches
+        - name: modifies-value-receiver
+        - name: string-of-int
+        - name: unnecessary-stmt
+        - name: useless-break
+        - name: waitgroup-by-value
+        - name: duplicated-imports
+        - name: optimize-operands-order
+
+    gocritic:
+      enable-all: true
+      disabled-checks:
+        # Comment style here is prose that says what the code cannot, and these
+        # check its shape rather than its content.
+        - commentFormatting
+        - commentedOutCode
+        - todoCommentWithoutDetail
+        - whyNoLint
+        # Signature taste, not idiom.
+        - unnamedResult
+        - paramTypeCombine
+        - tooManyResultsChecker
+        # Copy cost is a measurement; none has been taken here.
+        - hugeParam
+        - rangeValCopy
+        # A parameter shadowing a package name is how this code reads already.
+        - importShadow
+        # The one deferInLoop site is a test's cleanup, which must run per item.
+        - deferInLoop
+
+    errcheck:
+      check-type-assertions: false
+      check-blank: false
+
+    staticcheck:
+      checks:
+        - all
+        # ST1000 (package comment shape) and ST1020-ST1022 (comment-on-export
+        # shape) are the same file as gocritic's comment checks above.
+        - -ST1000
+        - -ST1020
+        - -ST1021
+        - -ST1022
+        # ST1003 wants initialisms upper-cased; the names here are the store's.
+        - -ST1003
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/aromanovich/pgnotch
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

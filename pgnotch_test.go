@@ -1,0 +1,425 @@
+package pgnotch_test
+
+import (
+	"bytes"
+	"context"
+	"math/rand"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/stretchr/testify/require"
+
+	"github.com/aromanovich/pgnotch"
+)
+
+// TestOpenRefusesASchemaNobodyMigrated is the whole of what [pgnotch.Open]
+// promises beyond handing back a Store, and it is worth a test because the
+// alternative — conjuring the schema from inside the constructor — is what a
+// caller will assume it does.
+//
+// The refusal has to be [pgnotch.ErrNotMigrated] and not a relation-does-not-exist
+// from three calls later: a caller that wants the old behaviour matches on it
+// and calls Migrate.
+func TestOpenRefusesASchemaNobodyMigrated(t *testing.T) {
+	ctx := testContext(t, time.Minute)
+
+	// A schema of this test's own that nothing has migrated: the tables are
+	// what Open is refusing the absence of, so it must not find them.
+	pool := openPoolIn(t, newSchema(), nil)
+
+	store, err := pgnotch.Open(ctx, pool)
+	require.Nil(t, store)
+	require.ErrorIs(t, err, pgnotch.ErrNotMigrated)
+}
+
+// TestALogIdIsAnyStringTheCallerLikes is the claim this package is built
+// around: a log's identifier is the caller's, and nothing about it reaches a
+// table name.
+//
+// The ids below are the ones a naming scheme would get wrong. Two of them
+// differ only in characters an identifier cannot hold, one is the maximum
+// length, one is not ASCII at all, and one is the decimal form of a number —
+// which is what a caller with numbered logs will pass. Every one of them has to
+// be its own log, so an append to one is invisible to the others.
+func TestALogIdIsAnyStringTheCallerLikes(t *testing.T) {
+	store := openStore(t)
+	ctx := testContext(t, time.Minute)
+
+	ids := []pgnotch.LogID{
+		"42",
+		"7f3c1b9e-1d2a-4c5e-8f00-0123456789ab",
+		"7f3c1b9e.1d2a.4c5e.8f00.0123456789ab",
+		"tenant/acme:orders",
+		"日本語のログ",
+		pgnotch.LogID(strings.Repeat("x", pgnotch.MaxLogIDBytes)),
+	}
+	const epoch = pgnotch.Epoch(1)
+	require.NoError(t, store.CreateLogs(ctx, ids...))
+	for _, id := range ids {
+		require.NoErrorf(t, store.Fence(ctx, id, epoch), "fencing %q", id)
+		require.NoErrorf(t, store.Append(ctx, id, epoch, pgnotch.FirstSeqno, [][]byte{[]byte(id)}),
+			"appending to %q", id)
+	}
+	for _, id := range ids {
+		entries, err := store.ReadFrom(ctx, id, pgnotch.FirstSeqno, 10)
+		require.NoErrorf(t, err, "reading %q", id)
+		require.Lenf(t, entries, 1, "%q holds somebody else's entries", id)
+		require.Equalf(t, []byte(id), entries[0].Payload, "%q came back with another log's entry", id)
+	}
+
+	// And the two an id cannot be, refused where they are passed rather than at
+	// whatever finally overflows.
+	require.Error(t, store.Fence(ctx, "", epoch))
+	require.Error(t, store.Fence(ctx, pgnotch.LogID(strings.Repeat("x", pgnotch.MaxLogIDBytes+1)), epoch))
+}
+
+// TestTheThreeRefusalsAreToldApart drives each refusal in turn on one log, in
+// the order the package promises to rank them.
+//
+// The last case is the one worth having: a writer that has lost its log
+// re-appending a batch it never got an answer for is refused as fenced and not
+// as already-written, because [pgnotch.ErrAlreadyWritten] is an ack and it would
+// take its successor's word for its own high-water mark.
+func TestTheThreeRefusalsAreToldApart(t *testing.T) {
+	store := openStore(t)
+	ctx := testContext(t, time.Minute)
+
+	const id = pgnotch.LogID("refusals")
+	const held, taken = pgnotch.Epoch(4), pgnotch.Epoch(5)
+	entry := [][]byte{[]byte("an entry")}
+
+	// Created and owned by nobody, which is a state of its own since a log is
+	// created rather than conjured, and is still [pgnotch.ErrFenced]: a log with
+	// no owner is not this caller's to write.
+	require.NoError(t, store.CreateLogs(ctx, id))
+	require.ErrorIs(t, store.Append(ctx, id, held, pgnotch.FirstSeqno, entry), pgnotch.ErrFenced)
+
+	require.NoError(t, store.Fence(ctx, id, held))
+	// A hole.
+	require.ErrorIs(t, store.Append(ctx, id, held, pgnotch.FirstSeqno+1, entry), pgnotch.ErrGap)
+
+	require.NoError(t, store.Append(ctx, id, held, pgnotch.FirstSeqno, entry))
+	// A seqno that is spent.
+	require.ErrorIs(t, store.Append(ctx, id, held, pgnotch.FirstSeqno, entry), pgnotch.ErrAlreadyWritten)
+
+	// And fenced outranks it, once the log has changed hands.
+	require.NoError(t, store.Fence(ctx, id, taken))
+	require.ErrorIs(t, store.Append(ctx, id, held, pgnotch.FirstSeqno, entry), pgnotch.ErrFenced)
+
+	// An epoch *above* the log's is refused just as flatly, and this is the
+	// direction easy to leave open: a writer becomes the owner by fencing, and
+	// an append is not a fence. Relax the append's `epoch = $3` to `epoch <= $3`
+	// and every other assertion here stays green while a writer that never
+	// fenced writes into somebody else's log.
+	require.ErrorIs(t, store.Append(ctx, id, taken+1, pgnotch.FirstSeqno+1, entry), pgnotch.ErrFenced)
+
+	// Nothing any of those refusals touched is in the log.
+	entries, err := store.ReadFrom(ctx, id, pgnotch.FirstSeqno, 10)
+	require.NoError(t, err)
+	require.Equal(t, []pgnotch.Entry{{Seqno: pgnotch.FirstSeqno, Epoch: held, Payload: []byte("an entry")}}, entries)
+}
+
+// TestAFenceReachesAnotherStore is the half of fencing a single Store cannot
+// state. Two [pgnotch.Store]s over one schema are what two processes owning a
+// log in turn look like from here, and the refusal has to come from the
+// database rather than from a value one of them is holding.
+//
+// This package keeps no per-log state in the process at all — every decision is
+// the registry row's — so what this adds is narrow and worth being explicit
+// about: it is the proof that the epoch check lives in the UPDATE's WHERE
+// clause. Delete `AND epoch = $3` from the append and this goes red.
+func TestAFenceReachesAnotherStore(t *testing.T) {
+	incumbent, pool := openStoreIn(t, newSchema(), nil)
+	ctx := testContext(t, time.Minute)
+
+	successor, err := pgnotch.Open(ctx, pool)
+	require.NoError(t, err)
+
+	const id = pgnotch.LogID("handed-over")
+	const held, taken = pgnotch.Epoch(4), pgnotch.Epoch(5)
+
+	require.NoError(t, incumbent.CreateLogs(ctx, id))
+	require.NoError(t, incumbent.Fence(ctx, id, held))
+	require.NoError(t, incumbent.Append(ctx, id, held, pgnotch.FirstSeqno,
+		[][]byte{[]byte("the incumbent's entry")}))
+
+	require.NoError(t, successor.Fence(ctx, id, taken))
+
+	err = incumbent.Append(ctx, id, held, pgnotch.FirstSeqno+1, [][]byte{[]byte("a zombie's entry")})
+	require.ErrorIs(t, err, pgnotch.ErrFenced,
+		"the ex-owner, which nobody told, appended at the epoch it still believes it holds")
+
+	// The successor inherits the log rather than starting one, and what it
+	// reads is what the incumbent was acked for and nothing the zombie wrote.
+	require.NoError(t, successor.Append(ctx, id, taken, pgnotch.FirstSeqno+1,
+		[][]byte{[]byte("the successor's entry")}))
+	entries, err := successor.ReadFrom(ctx, id, pgnotch.FirstSeqno, 10)
+	require.NoError(t, err)
+	require.Equal(t, []pgnotch.Entry{
+		{Seqno: pgnotch.FirstSeqno, Epoch: held, Payload: []byte("the incumbent's entry")},
+		{Seqno: pgnotch.FirstSeqno + 1, Epoch: taken, Payload: []byte("the successor's entry")},
+	}, entries)
+}
+
+// TestAnEntryLargerThanAPageSurvivesTheRoundTrip is what chunking is for. The
+// payload column is `bytea STORAGE PLAIN`, so PostgreSQL will not move an
+// oversized value out of line — it refuses the row instead — and entries are
+// split here to stay under that ceiling.
+//
+// It goes red if chunking is removed: the append fails with "row is too big",
+// which is the whole point of the STORAGE PLAIN clause. A silent TOAST would
+// have made this pass and put a btree under the log.
+func TestAnEntryLargerThanAPageSurvivesTheRoundTrip(t *testing.T) {
+	store := openStore(t)
+	ctx := testContext(t, 2*time.Minute)
+
+	const id = pgnotch.LogID("big-entries")
+	const epoch = pgnotch.Epoch(3)
+	require.NoError(t, store.CreateLogs(ctx, id))
+	require.NoError(t, store.Fence(ctx, id, epoch))
+
+	// Deterministic, so a failure is reproducible from the seed alone. The
+	// sizes straddle a chunk in both directions and the megabyte is the tail
+	// that would otherwise only be met in production.
+	random := rand.New(rand.NewSource(20260823))
+	sizes := []int{0, 1, 500, pgnotch.MaxEntryChunk, pgnotch.MaxEntryChunk + 1, 20 << 10, 1 << 20}
+	for range 8 {
+		sizes = append(sizes, 500+random.Intn(20<<10-500))
+	}
+
+	want := make([]pgnotch.Entry, 0, len(sizes))
+	for i, size := range sizes {
+		payload := make([]byte, size)
+		random.Read(payload)
+		seqno := pgnotch.FirstSeqno + pgnotch.Seqno(i)
+		require.NoErrorf(t, store.Append(ctx, id, epoch, seqno, [][]byte{payload}),
+			"appending an entry of %d bytes", size)
+		want = append(want, pgnotch.Entry{Seqno: seqno, Epoch: epoch, Payload: payload})
+	}
+
+	got, err := store.ReadFrom(ctx, id, pgnotch.FirstSeqno, len(sizes))
+	require.NoError(t, err)
+	require.Len(t, got, len(want))
+	for i := range want {
+		require.Equalf(t, want[i].Seqno, got[i].Seqno, "entry %d came back at the wrong seqno", i)
+		require.Equalf(t, want[i].Epoch, got[i].Epoch, "entry %d came back at the wrong epoch", i)
+		require.Truef(t, bytes.Equal(want[i].Payload, got[i].Payload),
+			"entry %d of %d bytes came back as %d bytes", i, len(want[i].Payload), len(got[i].Payload))
+	}
+}
+
+// TestALogRotatesAndKeepsAnswering drives the ring past a rotation, which is
+// the machinery a short test never reaches: it trims as it goes, so the log
+// stays short and the ring turns, and everything it asserts is what this
+// package promises anyway — the entries above the watermark are there, the ones
+// below it are gone, and the log stays appendable across the boundary.
+//
+// It goes red if rotation loses the half of the ring a read has to union in, or
+// if the trim watermark stops gating reads.
+func TestALogRotatesAndKeepsAnswering(t *testing.T) {
+	store := openStore(t)
+	ctx := testContext(t, 2*time.Minute)
+
+	const id = pgnotch.LogID("rotating")
+	const epoch = pgnotch.Epoch(2)
+	require.NoError(t, store.CreateLogs(ctx, id))
+	require.NoError(t, store.Fence(ctx, id, epoch))
+
+	// Two full rotations' worth, in batches, trimming a long way behind the
+	// head so that the ring's other half is reclaimable by the time it is
+	// needed.
+	const batch = 256
+	const total = 10 * 1024
+	payload := bytes.Repeat([]byte("x"), 900)
+	for base := pgnotch.Seqno(0); base < total; base += batch {
+		payloads := make([][]byte, batch)
+		for i := range payloads {
+			payloads[i] = payload
+		}
+		require.NoError(t, store.Append(ctx, id, epoch, pgnotch.FirstSeqno+base, payloads))
+		if base >= 2*batch {
+			require.NoError(t, store.Trim(ctx, id, pgnotch.FirstSeqno+base-2*batch))
+		}
+	}
+
+	// What a reader sees after all that is the log this package describes: it
+	// starts just above the last watermark and runs to the head with no holes.
+	// The last trim of the loop names the entry below the first live one.
+	firstLive := pgnotch.FirstSeqno + total - 3*batch + 1
+	entries, err := store.ReadFrom(ctx, id, pgnotch.FirstSeqno, 16)
+	require.NoError(t, err)
+	require.NotEmpty(t, entries, "the log came back empty after rotating")
+	require.Equalf(t, firstLive, entries[0].Seqno,
+		"the log starts at %d rather than just above the trim watermark", entries[0].Seqno)
+	for i := range entries {
+		require.Equal(t, firstLive+pgnotch.Seqno(i), entries[i].Seqno, "the log has a hole in it")
+		require.Equal(t, payload, entries[i].Payload)
+	}
+
+	// And it is still this epoch's, still appendable at the next seqno, and the
+	// seqnos the trim took are still spent.
+	require.NoError(t, store.Append(ctx, id, epoch, pgnotch.FirstSeqno+total,
+		[][]byte{[]byte("after the rotations")}))
+	err = store.Append(ctx, id, epoch, pgnotch.FirstSeqno, [][]byte{[]byte("into the trimmed prefix")})
+	require.ErrorIs(t, err, pgnotch.ErrAlreadyWritten,
+		"a seqno a trim removed was handed out again, which is a hole in a log that promises none")
+}
+
+// TestDropLeavesTheEntryTablesOfNoLogBehind is what [pgnotch.Drop] promises: the
+// tables it removes are found through the registry, so an unbounded set of
+// per-log tables goes with it and nothing is left holding disk that no later
+// call could name.
+func TestDropLeavesTheEntryTablesOfNoLogBehind(t *testing.T) {
+	ctx := testContext(t, time.Minute)
+	schema := newSchema()
+	store, pool := openStoreIn(t, schema, nil)
+
+	require.NoError(t, store.CreateLogs(ctx, "one", "two", "three"))
+	require.Equal(t, 6, tablesLike(ctx, t, pool, schema, entryTablePattern),
+		"three logs should hold two entry tables each")
+
+	require.NoError(t, pgnotch.Drop(ctx, pool))
+
+	require.Zero(t, tablesLike(ctx, t, pool, schema, `pgnotch\_%`),
+		"Drop left tables behind that nothing can enumerate any more")
+}
+
+// tablesLike counts this schema's tables matching a LIKE pattern.
+func tablesLike(ctx context.Context, t *testing.T, pool *pgxpool.Pool, schema, pattern string) int {
+	t.Helper()
+	var count int
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*)::int FROM pg_tables WHERE schemaname = $1 AND tablename LIKE $2`,
+		schema, pattern).Scan(&count))
+	return count
+}
+
+// TestFencingALogNobodyCreatedMakesNoTables is the whole of why creating a log
+// is a call of its own.
+//
+// A [pgnotch.LogID] is an arbitrary string, so a fence that brought a log into
+// existence would turn one bad id — a wrong tenant, an unescaped input, a retry
+// loop with a counter in it — into two PostgreSQL tables at whatever rate it
+// was called, and nothing gives those back on its own. The refusal is worth
+// less than the assertion under it: what matters is that the catalogue is
+// untouched afterwards.
+func TestFencingALogNobodyCreatedMakesNoTables(t *testing.T) {
+	ctx := testContext(t, time.Minute)
+	schema := newSchema()
+	store, pool := openStoreIn(t, schema, nil)
+
+	before := tablesLike(ctx, t, pool, schema, entryTablePattern)
+	for _, id := range []pgnotch.LogID{"typo", "tenant/../etc", "999999"} {
+		err := store.Fence(ctx, id, 1)
+		require.ErrorIsf(t, err, pgnotch.ErrNoSuchLog, "fencing %q", id)
+	}
+	require.Equalf(t, before, tablesLike(ctx, t, pool, schema, entryTablePattern),
+		"a refused fence left entry tables behind, so a bad id is a table nobody asked for")
+}
+
+// TestCreateLogsIsIdempotent is what lets a process run it over its whole set
+// on every start: the second pass must leave the first pass's logs exactly as
+// they are, ownership and entries included.
+func TestCreateLogsIsIdempotent(t *testing.T) {
+	ctx := testContext(t, time.Minute)
+	schema := newSchema()
+	store, pool := openStoreIn(t, schema, nil)
+
+	ids := []pgnotch.LogID{"a", "b", "c"}
+	require.NoError(t, store.CreateLogs(ctx, ids...))
+	require.NoError(t, store.Fence(ctx, "a", 1))
+	require.NoError(t, store.Append(ctx, "a", 1, pgnotch.FirstSeqno, [][]byte{[]byte("written before")}))
+	tables := tablesLike(ctx, t, pool, schema, entryTablePattern)
+
+	// Again, over a set that overlaps the first only partly.
+	require.NoError(t, store.CreateLogs(ctx, append(ids, "d")...))
+
+	require.Equal(t, tables+2, tablesLike(ctx, t, pool, schema, entryTablePattern),
+		"a second CreateLogs made tables for logs that already had them")
+	entries, err := store.ReadFrom(ctx, "a", pgnotch.FirstSeqno, 10)
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "a second CreateLogs took an existing log's entries with it")
+	require.NoError(t, store.Append(ctx, "a", 1, pgnotch.FirstSeqno+1, [][]byte{[]byte("after")}),
+		"a second CreateLogs reset an existing log's ownership")
+}
+
+// TestMigrateIsIdempotent is the property a deploy depends on: every process
+// that comes up may run it, and the second one through must find nothing to do
+// rather than fail or rebuild the schema under the first.
+func TestMigrateIsIdempotent(t *testing.T) {
+	ctx := testContext(t, time.Minute)
+	store, pool := openStoreIn(t, newSchema(), nil)
+
+	const id = pgnotch.LogID("survivor")
+	const epoch = pgnotch.Epoch(1)
+	require.NoError(t, store.CreateLogs(ctx, id))
+	require.NoError(t, store.Fence(ctx, id, epoch))
+	require.NoError(t, store.Append(ctx, id, epoch, pgnotch.FirstSeqno, [][]byte{[]byte("written before")}))
+
+	require.NoError(t, pgnotch.Migrate(ctx, pool))
+
+	entries, err := store.ReadFrom(ctx, id, pgnotch.FirstSeqno, 10)
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "a second Migrate took the log with it")
+}
+
+// TestTrimOfALogThatHeldNothingLeavesItAppendable is the one case the arithmetic
+// gets wrong if the watermark is not clamped to the tail.
+//
+// A trim names entries to remove, so on a log that never held them it removes
+// nothing — and a watermark left past the tail would hide the entry appended
+// there afterwards forever, from a log that reports itself empty and accepts
+// the append.
+func TestTrimOfALogThatHeldNothingLeavesItAppendable(t *testing.T) {
+	store := openStore(t)
+	ctx := testContext(t, time.Minute)
+
+	const id = pgnotch.LogID("trimmed-while-empty")
+	const epoch = pgnotch.Epoch(1)
+	require.NoError(t, store.CreateLogs(ctx, id))
+	require.NoError(t, store.Fence(ctx, id, epoch))
+	require.NoError(t, store.Trim(ctx, id, 1000))
+
+	require.NoError(t, store.Append(ctx, id, epoch, pgnotch.FirstSeqno, [][]byte{[]byte("after the trim")}))
+	entries, err := store.ReadFrom(ctx, id, pgnotch.FirstSeqno, 10)
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "the entry appended after the trim is hidden by the trim's watermark")
+	require.Equal(t, []byte("after the trim"), entries[0].Payload)
+}
+
+// TestAPayloadIsNobodyElsesMemory is a promise about aliasing that no caller
+// can check for itself and every caller relies on: the batch it passed is not
+// retained, and the payloads it gets back are its own to keep.
+func TestAPayloadIsNobodyElsesMemory(t *testing.T) {
+	store := openStore(t)
+	ctx := testContext(t, time.Minute)
+
+	const id = pgnotch.LogID("aliasing")
+	const epoch = pgnotch.Epoch(1)
+	require.NoError(t, store.CreateLogs(ctx, id))
+	require.NoError(t, store.Fence(ctx, id, epoch))
+
+	// The caller's buffer is reused for the next entry, which is what an
+	// encoder with a scratch buffer does.
+	scratch := []byte("the first entry ")
+	require.NoError(t, store.Append(ctx, id, epoch, pgnotch.FirstSeqno, [][]byte{scratch}))
+	copy(scratch, "OVERWRITTEN     ")
+	require.NoError(t, store.Append(ctx, id, epoch, pgnotch.FirstSeqno+1, [][]byte{scratch}))
+
+	entries, err := store.ReadFrom(ctx, id, pgnotch.FirstSeqno, 10)
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+	require.Equal(t, []byte("the first entry "), entries[0].Payload,
+		"the log kept the caller's slice and read it again after Append returned")
+
+	// And what came back aliases nothing the next read will hand out.
+	for i := range entries[0].Payload {
+		entries[0].Payload[i] = '!'
+	}
+	again, err := store.ReadFrom(ctx, id, pgnotch.FirstSeqno, 10)
+	require.NoError(t, err)
+	require.Equal(t, []byte("the first entry "), again[0].Payload,
+		"writing into a payload the log handed out changed what the next read returns")
+}
