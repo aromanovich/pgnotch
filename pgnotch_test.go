@@ -343,6 +343,90 @@ func TestTrimOfALogThatHeldNothingLeavesItAppendable(t *testing.T) {
 	require.Equal(t, []byte("after the trim"), entries[0].Payload)
 }
 
+func TestTheNextSeqnoIsWhereAnAppendMustGo(t *testing.T) {
+	store := openStore(t)
+	ctx := testContext(t, time.Minute)
+
+	const id = pgnotch.LogID("where-next")
+	const epoch = pgnotch.Epoch(1)
+	require.NoError(t, store.CreateLogs(ctx, id))
+	require.NoError(t, store.Fence(ctx, id, epoch))
+
+	next, err := store.NextSeqno(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, pgnotch.FirstSeqno, next, "a log nothing has appended to starts at the first seqno")
+
+	require.NoError(t, store.Append(ctx, id, epoch, next, [][]byte{[]byte("a"), []byte("b")}))
+	next, err = store.NextSeqno(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, pgnotch.FirstSeqno+2, next)
+
+	// The value is the whole of what a writer needs to go on appending, which is
+	// the point of it: it took no mark from the append it just made.
+	require.NoError(t, store.Append(ctx, id, epoch, next, [][]byte{[]byte("c")}))
+	entries, err := store.ReadFrom(ctx, id, pgnotch.FirstSeqno, 10)
+	require.NoError(t, err)
+	require.Len(t, entries, 3)
+}
+
+// TestTheNextSeqnoOutlivesTheEntries is the case a read cannot answer: a log
+// every entry of which a trim has taken reads as empty, so a successor sizing it
+// up by reading would start again at the first seqno and be refused all the way
+// back to where it should have started.
+func TestTheNextSeqnoOutlivesTheEntries(t *testing.T) {
+	store := openStore(t)
+	ctx := testContext(t, time.Minute)
+
+	const id = pgnotch.LogID("trimmed-to-the-end")
+	const epoch = pgnotch.Epoch(1)
+	require.NoError(t, store.CreateLogs(ctx, id))
+	require.NoError(t, store.Fence(ctx, id, epoch))
+	require.NoError(t, store.Append(ctx, id, epoch,
+		pgnotch.FirstSeqno, [][]byte{[]byte("a"), []byte("b"), []byte("c")}))
+	require.NoError(t, store.Trim(ctx, id, pgnotch.FirstSeqno+2))
+
+	entries, err := store.ReadFrom(ctx, id, pgnotch.FirstSeqno, 10)
+	require.NoError(t, err)
+	require.Empty(t, entries, "everything the log held has been trimmed")
+
+	next, err := store.NextSeqno(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, pgnotch.FirstSeqno+3, next)
+	require.NoError(t, store.Append(ctx, id, epoch, next, [][]byte{[]byte("d")}),
+		"the seqno it names is the one the log admits")
+}
+
+func TestTheNextSeqnoOfALogNobodyCreated(t *testing.T) {
+	store := openStore(t)
+	ctx := testContext(t, time.Minute)
+
+	_, err := store.NextSeqno(ctx, "never-created")
+	require.ErrorIs(t, err, pgnotch.ErrNoSuchLog)
+}
+
+func TestTheNextSeqnoReachesANewOwner(t *testing.T) {
+	store := openStore(t)
+	ctx := testContext(t, time.Minute)
+
+	const id = pgnotch.LogID("handed-over")
+	require.NoError(t, store.CreateLogs(ctx, id))
+	require.NoError(t, store.Fence(ctx, id, 1))
+	require.NoError(t, store.Append(ctx, id, 1, pgnotch.FirstSeqno, [][]byte{[]byte("a"), []byte("b")}))
+
+	// The successor holds no mark of its own, which is the situation this call
+	// exists for: it fences, asks, and continues the log.
+	require.NoError(t, store.Fence(ctx, id, 2))
+	next, err := store.NextSeqno(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, pgnotch.FirstSeqno+2, next)
+	require.NoError(t, store.Append(ctx, id, 2, next, [][]byte{[]byte("c")}))
+
+	entries, err := store.ReadFrom(ctx, id, pgnotch.FirstSeqno, 10)
+	require.NoError(t, err)
+	require.Len(t, entries, 3)
+	require.Equal(t, pgnotch.Epoch(2), entries[2].Epoch)
+}
+
 // TestAPayloadIsNobodyElsesMemory is the aliasing promise no caller can check
 // for itself: the batch passed in is not retained, and the payloads handed back
 // are the caller's to keep.

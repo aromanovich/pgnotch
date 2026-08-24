@@ -5,7 +5,8 @@
 // chooses, created by [Store.CreateLogs] and never as a side effect. One writer
 // owns it at a time, at an epoch [Store.Fence] takes, so a writer that has lost
 // its log finds out at its next append. The owner assigns seqnos itself, which
-// lets an append be a single statement.
+// lets an append be a single statement, and a new owner asks [Store.NextSeqno]
+// where the log it has just taken ended.
 //
 // # What a caller may rely on
 //

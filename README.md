@@ -74,9 +74,13 @@ err = store.Append(ctx, shipments, epoch, pgnotch.FirstSeqno+2, [][]byte{
 entries, err := store.ReadFrom(ctx, shipments, pgnotch.FirstSeqno, 100)
 ```
 
-A writer that has just fenced a log somebody else wrote does not have that mark
-and there is no call that hands it over: it reads for it, `ReadFrom` until a
-short read, and appends at the last entry's seqno plus one. A replay after an
+A writer that has just fenced a log somebody else wrote does not have that mark,
+and `NextSeqno` is what hands it over: one registry row by primary key, and the
+seqno the next append must start at. Reading the log for it works too and is
+what a caller had to do before that existed, but it is a round trip per page
+over tables that carry no index, and it cannot answer for a log whose entries a
+trim has all taken — there is nothing left to read, and starting again at the
+first seqno is not where that log goes. A replay after an
 ambiguous append is the other case that looks like a new seqno and is not —
 resend *the same* batch at the same seqno and read `ErrAlreadyWritten` as the
 ack.
@@ -373,8 +377,9 @@ Three things follow from what a log is, rather than from the tool:
 * **it trims behind itself**, which is what makes an unbounded run cost a
   bounded amount of disk. `-retain 0` turns that off and the tables then grow
   for as long as it runs;
-* **it picks up where it left off.** A restart reads each log for its mark the
-  way any new owner has to, and says which seqno it continues at.
+* **it picks up where it left off.** A restart asks each log where its next
+  append goes, the way any new owner has to, and says which seqno it continues
+  at.
 
 The rate is a schedule fixed when the run starts, not a sleep between appends,
 so a slow round trip is repaid out of the slots after it rather than lowering

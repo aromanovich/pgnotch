@@ -397,6 +397,36 @@ func (s *Store) ReadFrom(ctx context.Context, id LogID, from Seqno, limit int) (
 	return entries, nil
 }
 
+// NextSeqno is the seqno the log's next append must start at: one past its last
+// entry, and [FirstSeqno] for a log nothing has appended to. A log that does not
+// exist is [ErrNoSuchLog].
+//
+// It is what a writer that has just fenced a log somebody else wrote needs and
+// does not have. Reading the log for it works and is what a caller had to do
+// before this existed, but it costs a round trip per page and the entry tables
+// carry no index; this is one row, found by primary key, and it is right for a
+// log whose entries a trim has all taken — which a read cannot be, there being
+// nothing left to read.
+//
+// The value is the caller's to append at only while it owns the log: an append
+// by a higher epoch moves it. That is not a race to lose, because it is not the
+// mark that keeps two writers apart — an append at a stale seqno is refused
+// ([ErrAlreadyWritten], [ErrGap]) rather than misplaced, and one from a fenced-
+// out epoch is refused whatever seqno it names.
+func (s *Store) NextSeqno(ctx context.Context, id LogID) (Seqno, error) {
+	if err := checkLogID(id); err != nil {
+		return 0, err
+	}
+	st, found, err := s.readState(ctx, id)
+	if err != nil {
+		return 0, err
+	}
+	if !found {
+		return 0, fmt.Errorf("pgnotch: the next seqno of %q: %w", id, ErrNoSuchLog)
+	}
+	return st.lastSeqno + 1, nil
+}
+
 // Trim removes the log's entries at or below upTo. Trimming entries that are
 // not there is not an error: Trim states where the log should start, and
 // repeating it is harmless. The log stays appendable at the next seqno,
