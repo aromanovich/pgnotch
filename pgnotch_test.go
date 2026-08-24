@@ -14,19 +14,14 @@ import (
 	"github.com/aromanovich/pgnotch"
 )
 
-// TestOpenRefusesASchemaNobodyMigrated is the whole of what [pgnotch.Open]
-// promises beyond handing back a Store, and it is worth a test because the
-// alternative — conjuring the schema from inside the constructor — is what a
-// caller will assume it does.
-//
-// The refusal has to be [pgnotch.ErrNotMigrated] and not a relation-does-not-exist
-// from three calls later: a caller that wants the old behaviour matches on it
-// and calls Migrate.
+// TestOpenRefusesASchemaNobodyMigrated pins the error identity: the refusal is
+// [pgnotch.ErrNotMigrated], not a relation-does-not-exist three calls later,
+// because a caller that wants the schema created matches on it and calls Migrate.
 func TestOpenRefusesASchemaNobodyMigrated(t *testing.T) {
 	ctx := testContext(t, time.Minute)
 
-	// A schema of this test's own that nothing has migrated: the tables are
-	// what Open is refusing the absence of, so it must not find them.
+	// A schema nothing has migrated: the tables are what Open refuses the
+	// absence of.
 	pool := openPoolIn(t, newSchema(), nil)
 
 	store, err := pgnotch.Open(ctx, pool)
@@ -34,15 +29,9 @@ func TestOpenRefusesASchemaNobodyMigrated(t *testing.T) {
 	require.ErrorIs(t, err, pgnotch.ErrNotMigrated)
 }
 
-// TestALogIdIsAnyStringTheCallerLikes is the claim this package is built
-// around: a log's identifier is the caller's, and nothing about it reaches a
-// table name.
-//
-// The ids below are the ones a naming scheme would get wrong. Two of them
-// differ only in characters an identifier cannot hold, one is the maximum
-// length, one is not ASCII at all, and one is the decimal form of a number —
-// which is what a caller with numbered logs will pass. Every one of them has to
-// be its own log, so an append to one is invisible to the others.
+// TestALogIdIsAnyStringTheCallerLikes: a log's identifier is the caller's, and
+// nothing about it reaches a table name. The ids below are the ones a naming
+// scheme would get wrong, which is why a log's tables are named from an ordinal.
 func TestALogIdIsAnyStringTheCallerLikes(t *testing.T) {
 	store := openStore(t)
 	ctx := testContext(t, time.Minute)
@@ -69,18 +58,15 @@ func TestALogIdIsAnyStringTheCallerLikes(t *testing.T) {
 		require.Equalf(t, []byte(id), entries[0].Payload, "%q came back with another log's entry", id)
 	}
 
-	// And the two an id cannot be, refused where they are passed rather than at
+	// The two an id cannot be, refused where they are passed rather than at
 	// whatever finally overflows.
 	require.Error(t, store.Fence(ctx, "", epoch))
 	require.Error(t, store.Fence(ctx, pgnotch.LogID(strings.Repeat("x", pgnotch.MaxLogIDBytes+1)), epoch))
 }
 
-// TestTheThreeRefusalsAreToldApart drives each refusal in turn on one log, in
-// the order the package promises to rank them.
-//
-// The last case is the one worth having: a writer that has lost its log
-// re-appending a batch it never got an answer for is refused as fenced and not
-// as already-written, because [pgnotch.ErrAlreadyWritten] is an ack and it would
+// TestTheThreeRefusalsAreToldApart: a writer that has lost its log re-appending
+// a batch it never got an answer for is refused as fenced and not as
+// already-written, because [pgnotch.ErrAlreadyWritten] is an ack and it would
 // take its successor's word for its own high-water mark.
 func TestTheThreeRefusalsAreToldApart(t *testing.T) {
 	store := openStore(t)
@@ -90,29 +76,24 @@ func TestTheThreeRefusalsAreToldApart(t *testing.T) {
 	const held, taken = pgnotch.Epoch(4), pgnotch.Epoch(5)
 	entry := [][]byte{[]byte("an entry")}
 
-	// Created and owned by nobody, which is a state of its own since a log is
-	// created rather than conjured, and is still [pgnotch.ErrFenced]: a log with
-	// no owner is not this caller's to write.
+	// Created and owned by nobody is a state of its own, and still
+	// [pgnotch.ErrFenced]: a log with no owner is not this caller's to write.
 	require.NoError(t, store.CreateLogs(ctx, id))
 	require.ErrorIs(t, store.Append(ctx, id, held, pgnotch.FirstSeqno, entry), pgnotch.ErrFenced)
 
 	require.NoError(t, store.Fence(ctx, id, held))
-	// A hole.
 	require.ErrorIs(t, store.Append(ctx, id, held, pgnotch.FirstSeqno+1, entry), pgnotch.ErrGap)
 
 	require.NoError(t, store.Append(ctx, id, held, pgnotch.FirstSeqno, entry))
-	// A seqno that is spent.
 	require.ErrorIs(t, store.Append(ctx, id, held, pgnotch.FirstSeqno, entry), pgnotch.ErrAlreadyWritten)
 
-	// And fenced outranks it, once the log has changed hands.
 	require.NoError(t, store.Fence(ctx, id, taken))
 	require.ErrorIs(t, store.Append(ctx, id, held, pgnotch.FirstSeqno, entry), pgnotch.ErrFenced)
 
-	// An epoch *above* the log's is refused just as flatly, and this is the
-	// direction easy to leave open: a writer becomes the owner by fencing, and
-	// an append is not a fence. Relax the append's `epoch = $3` to `epoch <= $3`
-	// and every other assertion here stays green while a writer that never
-	// fenced writes into somebody else's log.
+	// An epoch *above* the log's is refused as flatly, and that direction is the
+	// easy one to leave open: a writer becomes the owner by fencing, and an
+	// append is not a fence. Relax the append's `epoch = $3` to `epoch <= $3` and
+	// every other assertion here stays green.
 	require.ErrorIs(t, store.Append(ctx, id, taken+1, pgnotch.FirstSeqno+1, entry), pgnotch.ErrFenced)
 
 	// Nothing any of those refusals touched is in the log.
@@ -122,14 +103,10 @@ func TestTheThreeRefusalsAreToldApart(t *testing.T) {
 }
 
 // TestAFenceReachesAnotherStore is the half of fencing a single Store cannot
-// state. Two [pgnotch.Store]s over one schema are what two processes owning a
-// log in turn look like from here, and the refusal has to come from the
-// database rather than from a value one of them is holding.
-//
-// This package keeps no per-log state in the process at all — every decision is
-// the registry row's — so what this adds is narrow and worth being explicit
-// about: it is the proof that the epoch check lives in the UPDATE's WHERE
-// clause. Delete `AND epoch = $3` from the append and this goes red.
+// state: two [pgnotch.Store]s over one schema are two processes owning a log in
+// turn, so the refusal must come from the database and not from a value one of
+// them holds. This package keeps no per-log state in the process — every decision
+// is the registry row's. Delete `AND epoch = $3` from the append and this goes red.
 func TestAFenceReachesAnotherStore(t *testing.T) {
 	incumbent, pool := openStoreIn(t, newSchema(), nil)
 	ctx := testContext(t, time.Minute)
@@ -151,8 +128,8 @@ func TestAFenceReachesAnotherStore(t *testing.T) {
 	require.ErrorIs(t, err, pgnotch.ErrFenced,
 		"the ex-owner, which nobody told, appended at the epoch it still believes it holds")
 
-	// The successor inherits the log rather than starting one, and what it
-	// reads is what the incumbent was acked for and nothing the zombie wrote.
+	// The successor inherits the log rather than starting one: it reads what the
+	// incumbent was acked for and nothing the zombie wrote.
 	require.NoError(t, successor.Append(ctx, id, taken, pgnotch.FirstSeqno+1,
 		[][]byte{[]byte("the successor's entry")}))
 	entries, err := successor.ReadFrom(ctx, id, pgnotch.FirstSeqno, 10)
@@ -164,13 +141,10 @@ func TestAFenceReachesAnotherStore(t *testing.T) {
 }
 
 // TestAnEntryLargerThanAPageSurvivesTheRoundTrip is what chunking is for. The
-// payload column is `bytea STORAGE PLAIN`, so PostgreSQL will not move an
-// oversized value out of line — it refuses the row instead — and entries are
-// split here to stay under that ceiling.
-//
-// It goes red if chunking is removed: the append fails with "row is too big",
-// which is the whole point of the STORAGE PLAIN clause. A silent TOAST would
-// have made this pass and put a btree under the log.
+// payload column is `bytea STORAGE PLAIN`, so PostgreSQL refuses an oversized
+// row rather than moving the value out of line; remove chunking and the append
+// fails with "row is too big". A silent TOAST would have made this pass and put
+// a btree under the log.
 func TestAnEntryLargerThanAPageSurvivesTheRoundTrip(t *testing.T) {
 	store := openStore(t)
 	ctx := testContext(t, 2*time.Minute)
@@ -180,9 +154,9 @@ func TestAnEntryLargerThanAPageSurvivesTheRoundTrip(t *testing.T) {
 	require.NoError(t, store.CreateLogs(ctx, id))
 	require.NoError(t, store.Fence(ctx, id, epoch))
 
-	// Deterministic, so a failure is reproducible from the seed alone. The
-	// sizes straddle a chunk in both directions and the megabyte is the tail
-	// that would otherwise only be met in production.
+	// Deterministic, so a failure is reproducible from the seed alone. The sizes
+	// straddle a chunk in both directions, and the megabyte is the tail that
+	// would otherwise only be met in production.
 	random := rand.New(rand.NewSource(20260823))
 	sizes := []int{0, 1, 500, pgnotch.MaxEntryChunk, pgnotch.MaxEntryChunk + 1, 20 << 10, 1 << 20}
 	for range 8 {
@@ -210,14 +184,9 @@ func TestAnEntryLargerThanAPageSurvivesTheRoundTrip(t *testing.T) {
 	}
 }
 
-// TestALogRotatesAndKeepsAnswering drives the ring past a rotation, which is
-// the machinery a short test never reaches: it trims as it goes, so the log
-// stays short and the ring turns, and everything it asserts is what this
-// package promises anyway — the entries above the watermark are there, the ones
-// below it are gone, and the log stays appendable across the boundary.
-//
-// It goes red if rotation loses the half of the ring a read has to union in, or
-// if the trim watermark stops gating reads.
+// TestALogRotatesAndKeepsAnswering drives the ring past a rotation, trimming as
+// it goes so the log stays short. It goes red if rotation loses the half of the
+// ring a read has to union in, or if the trim watermark stops gating reads.
 func TestALogRotatesAndKeepsAnswering(t *testing.T) {
 	store := openStore(t)
 	ctx := testContext(t, 2*time.Minute)
@@ -227,9 +196,8 @@ func TestALogRotatesAndKeepsAnswering(t *testing.T) {
 	require.NoError(t, store.CreateLogs(ctx, id))
 	require.NoError(t, store.Fence(ctx, id, epoch))
 
-	// Two full rotations' worth, in batches, trimming a long way behind the
-	// head so that the ring's other half is reclaimable by the time it is
-	// needed.
+	// Two full rotations' worth, in batches, trimming a long way behind the head
+	// so the ring's other half is reclaimable by the time it is needed.
 	const batch = 256
 	const total = 10 * 1024
 	payload := bytes.Repeat([]byte("x"), 900)
@@ -244,9 +212,8 @@ func TestALogRotatesAndKeepsAnswering(t *testing.T) {
 		}
 	}
 
-	// What a reader sees after all that is the log this package describes: it
-	// starts just above the last watermark and runs to the head with no holes.
-	// The last trim of the loop names the entry below the first live one.
+	// The log starts just above the last watermark and runs to the head with no
+	// holes. The last trim of the loop names the entry below the first live one.
 	firstLive := pgnotch.FirstSeqno + total - 3*batch + 1
 	entries, err := store.ReadFrom(ctx, id, pgnotch.FirstSeqno, 16)
 	require.NoError(t, err)
@@ -258,8 +225,6 @@ func TestALogRotatesAndKeepsAnswering(t *testing.T) {
 		require.Equal(t, payload, entries[i].Payload)
 	}
 
-	// And it is still this epoch's, still appendable at the next seqno, and the
-	// seqnos the trim took are still spent.
 	require.NoError(t, store.Append(ctx, id, epoch, pgnotch.FirstSeqno+total,
 		[][]byte{[]byte("after the rotations")}))
 	err = store.Append(ctx, id, epoch, pgnotch.FirstSeqno, [][]byte{[]byte("into the trimmed prefix")})
@@ -267,10 +232,9 @@ func TestALogRotatesAndKeepsAnswering(t *testing.T) {
 		"a seqno a trim removed was handed out again, which is a hole in a log that promises none")
 }
 
-// TestDropLeavesTheEntryTablesOfNoLogBehind is what [pgnotch.Drop] promises: the
-// tables it removes are found through the registry, so an unbounded set of
-// per-log tables goes with it and nothing is left holding disk that no later
-// call could name.
+// TestDropLeavesTheEntryTablesOfNoLogBehind: [pgnotch.Drop] finds the tables it
+// removes through the registry, so an unbounded set of per-log tables goes with
+// it and nothing is left holding disk that no later call could name.
 func TestDropLeavesTheEntryTablesOfNoLogBehind(t *testing.T) {
 	ctx := testContext(t, time.Minute)
 	schema := newSchema()
@@ -286,7 +250,6 @@ func TestDropLeavesTheEntryTablesOfNoLogBehind(t *testing.T) {
 		"Drop left tables behind that nothing can enumerate any more")
 }
 
-// tablesLike counts this schema's tables matching a LIKE pattern.
 func tablesLike(ctx context.Context, t *testing.T, pool *pgxpool.Pool, schema, pattern string) int {
 	t.Helper()
 	var count int
@@ -296,15 +259,8 @@ func tablesLike(ctx context.Context, t *testing.T, pool *pgxpool.Pool, schema, p
 	return count
 }
 
-// TestFencingALogNobodyCreatedMakesNoTables is the whole of why creating a log
-// is a call of its own.
-//
-// A [pgnotch.LogID] is an arbitrary string, so a fence that brought a log into
-// existence would turn one bad id — a wrong tenant, an unescaped input, a retry
-// loop with a counter in it — into two PostgreSQL tables at whatever rate it
-// was called, and nothing gives those back on its own. The refusal is worth
-// less than the assertion under it: what matters is that the catalogue is
-// untouched afterwards.
+// TestFencingALogNobodyCreatedMakesNoTables pins what the refusal on its own
+// does not: the catalogue holds the same tables afterwards.
 func TestFencingALogNobodyCreatedMakesNoTables(t *testing.T) {
 	ctx := testContext(t, time.Minute)
 	schema := newSchema()
@@ -319,9 +275,9 @@ func TestFencingALogNobodyCreatedMakesNoTables(t *testing.T) {
 		"a refused fence left entry tables behind, so a bad id is a table nobody asked for")
 }
 
-// TestCreateLogsIsIdempotent is what lets a process run it over its whole set
-// on every start: the second pass must leave the first pass's logs exactly as
-// they are, ownership and entries included.
+// TestCreateLogsIsIdempotent is what lets a process run CreateLogs over its
+// whole set on every start: the second pass leaves the first pass's logs as they
+// are, ownership and entries included.
 func TestCreateLogsIsIdempotent(t *testing.T) {
 	ctx := testContext(t, time.Minute)
 	schema := newSchema()
@@ -345,9 +301,9 @@ func TestCreateLogsIsIdempotent(t *testing.T) {
 		"a second CreateLogs reset an existing log's ownership")
 }
 
-// TestMigrateIsIdempotent is the property a deploy depends on: every process
-// that comes up may run it, and the second one through must find nothing to do
-// rather than fail or rebuild the schema under the first.
+// TestMigrateIsIdempotent is the property a deploy depends on: every process may
+// run Migrate, and the second must find nothing to do rather than rebuild the
+// schema under the first.
 func TestMigrateIsIdempotent(t *testing.T) {
 	ctx := testContext(t, time.Minute)
 	store, pool := openStoreIn(t, newSchema(), nil)
@@ -365,13 +321,11 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	require.Len(t, entries, 1, "a second Migrate took the log with it")
 }
 
-// TestTrimOfALogThatHeldNothingLeavesItAppendable is the one case the arithmetic
-// gets wrong if the watermark is not clamped to the tail.
-//
-// A trim names entries to remove, so on a log that never held them it removes
-// nothing — and a watermark left past the tail would hide the entry appended
-// there afterwards forever, from a log that reports itself empty and accepts
-// the append.
+// TestTrimOfALogThatHeldNothingLeavesItAppendable is the case the arithmetic
+// gets wrong if the watermark is not clamped to the tail. A trim names entries
+// to remove, so on a log that never held them it removes nothing — and a
+// watermark left past the tail hides the entry appended there afterwards
+// forever, from a log that reports itself empty and accepts the append.
 func TestTrimOfALogThatHeldNothingLeavesItAppendable(t *testing.T) {
 	store := openStore(t)
 	ctx := testContext(t, time.Minute)
@@ -389,9 +343,9 @@ func TestTrimOfALogThatHeldNothingLeavesItAppendable(t *testing.T) {
 	require.Equal(t, []byte("after the trim"), entries[0].Payload)
 }
 
-// TestAPayloadIsNobodyElsesMemory is a promise about aliasing that no caller
-// can check for itself and every caller relies on: the batch it passed is not
-// retained, and the payloads it gets back are its own to keep.
+// TestAPayloadIsNobodyElsesMemory is the aliasing promise no caller can check
+// for itself: the batch passed in is not retained, and the payloads handed back
+// are the caller's to keep.
 func TestAPayloadIsNobodyElsesMemory(t *testing.T) {
 	store := openStore(t)
 	ctx := testContext(t, time.Minute)
@@ -401,8 +355,8 @@ func TestAPayloadIsNobodyElsesMemory(t *testing.T) {
 	require.NoError(t, store.CreateLogs(ctx, id))
 	require.NoError(t, store.Fence(ctx, id, epoch))
 
-	// The caller's buffer is reused for the next entry, which is what an
-	// encoder with a scratch buffer does.
+	// The caller's buffer is reused for the next entry, which is what an encoder
+	// with a scratch buffer does.
 	scratch := []byte("the first entry ")
 	require.NoError(t, store.Append(ctx, id, epoch, pgnotch.FirstSeqno, [][]byte{scratch}))
 	copy(scratch, "OVERWRITTEN     ")
@@ -414,7 +368,6 @@ func TestAPayloadIsNobodyElsesMemory(t *testing.T) {
 	require.Equal(t, []byte("the first entry "), entries[0].Payload,
 		"the log kept the caller's slice and read it again after Append returned")
 
-	// And what came back aliases nothing the next read will hand out.
 	for i := range entries[0].Payload {
 		entries[0].Payload[i] = '!'
 	}

@@ -206,11 +206,11 @@ change", there is not one yet; if you meant "these logs are finished", use
 `Drop` — or drop the schema.
 
 **Half the schema is not versioned, and cannot be.** There is one pair of entry
-tables per log and you may create logs forever, so they are created by a log's
-first `Fence`, inside the transaction that registers it — a registry row always
-has its tables. The cost is worth stating plainly: a schema change to the entry
-tables would be a migration against an unbounded set of tables, and there is no
-such migration today.
+tables per log and you may create logs forever, so they are created by
+`CreateLogs`, inside the transaction that registers each log — a registry row
+always has its tables. The cost: a schema change to the entry tables would be a
+migration against an unbounded set of tables, and there is no such migration
+today.
 
 **Size the driver's statement cache for your logs.** An append names its own
 log's tables, so its statement text is that log's alone and a connection holds

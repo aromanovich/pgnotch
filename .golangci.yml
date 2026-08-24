@@ -1,9 +1,8 @@
 version: "2"
 
-# What is enabled is what is green over the whole package. A linter that ships
-# red is a linter everybody learns to ignore, so anything whose findings this
-# package decided against is switched off here, with the reason, rather than
-# silenced one `//nolint` at a time.
+# Everything enabled here is green over the whole package. What this package
+# decided against is switched off below with the reason, rather than silenced
+# one `//nolint` at a time.
 
 linters:
   default: none
@@ -60,9 +59,8 @@ linters:
     gocritic:
       enable-all: true
       disabled-checks:
-        # The one exclusion this package needs: a result list is named where a
-        # name says something a type does not, and `([]int64, []int16, [][]byte)`
-        # is three parallel arrays whose names would be the types again.
+        # Result lists are named where a name says something the type does not,
+        # and `([]int64, []int16, [][]byte)` would be the types again.
         - unnamedResult
 
     staticcheck:
