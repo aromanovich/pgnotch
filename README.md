@@ -327,3 +327,7 @@ append writes, one for what it waits for — and both were written by breaking t
 implementation on purpose and watching them go red. They are the reason this
 package is worth having over any other way of putting a log in a table, so a
 change that makes either of them fail is a change to what this package is.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
