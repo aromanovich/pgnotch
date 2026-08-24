@@ -148,8 +148,13 @@ func TestFlagsRefuseARunThatWouldMeasureNothing(t *testing.T) {
 
 func TestFlagsDeriveTheScheduleFromTheRate(t *testing.T) {
 	t.Setenv(envDSN, "postgres://user:password@localhost:5432/db")
+	before := time.Now().Unix()
 	cfg, err := parseFlags([]string{"-rps=100", "-logs=4", "-retain=80000"})
 	require.NoError(t, err)
+
+	// An epoch nobody named is the clock, which is what makes each run's claim
+	// strictly greater than the last one's.
+	require.GreaterOrEqual(t, cfg.epoch, uint64(before))
 
 	// Four writers sharing 100 appends a second is one every 40 ms each.
 	require.Equal(t, 40*time.Millisecond, cfg.interval)

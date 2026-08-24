@@ -81,6 +81,8 @@ func (w *writer) tail(ctx context.Context, from pgnotch.Seqno) (pgnotch.Seqno, e
 func (w *writer) run(ctx context.Context, start time.Time) error {
 	pace := newPacer(start, w.cfg.interval, w.cfg.catchup)
 	batch := make([][]byte, 0, w.cfg.batch)
+	// A batch is drawn once and held until it is done with, because a replay
+	// after an ambiguous append has to be the same bytes at the same seqno.
 	fresh := true
 	for {
 		skipped, err := pace.wait(ctx)
@@ -93,9 +95,6 @@ func (w *writer) run(ctx context.Context, start time.Time) error {
 		}
 		done, err := w.append(ctx, batch)
 		if err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
 			return err
 		}
 		fresh = done

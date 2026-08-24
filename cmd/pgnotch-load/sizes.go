@@ -82,9 +82,6 @@ func parseBytes(text string) (int, error) {
 
 // draw is the length of the next entry.
 func (s *sizes) draw(rnd *rand.Rand) int {
-	if len(s.classes) == 1 {
-		return s.classes[0].bytes
-	}
 	// The first class whose running total is above the draw owns it.
 	i, _ := slices.BinarySearch(s.cum, rnd.IntN(s.total)+1)
 	return s.classes[i].bytes
@@ -147,12 +144,10 @@ func newCorpus(largest int) (*corpus, error) {
 	return &corpus{buf: buf}, nil
 }
 
-// payload is n bytes of the corpus. The result is the caller's to send and not
-// to modify: pgnotch copies what it encodes and keeps nothing.
+// payload is n bytes of the corpus, empty n included. The result is the
+// caller's to send and not to modify: pgnotch copies what it encodes and keeps
+// nothing.
 func (c *corpus) payload(rnd *rand.Rand, n int) []byte {
-	if n == 0 {
-		return c.buf[:0]
-	}
 	off := rnd.IntN(len(c.buf) - n + 1)
 	return c.buf[off : off+n]
 }

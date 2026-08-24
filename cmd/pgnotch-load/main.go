@@ -38,13 +38,9 @@ import (
 // named can write into tables somebody cared about.
 const envDSN = "PGNOTCH_DSN"
 
-// statementCache is pgx's default; a connection holds one prepared append per
-// log it has touched, so more logs than this turns every append into three
-// round trips and measures the cache rather than the log.
-const statementCache = 512
-
-// config is the whole of what the operator chooses, plus the two quantities
-// derived from it: the interval one writer keeps and the stride its trims move.
+// config is the whole of what the operator chooses, plus what is derived from
+// it once: the interval a writer keeps, how far behind it may catch up, the
+// stride its trims move, the pool size and the epoch it fences at.
 type config struct {
 	dsn      string
 	schema   string
@@ -63,14 +59,16 @@ type config struct {
 	duration time.Duration
 	migrate  bool
 	interval time.Duration
+	// cache is what the DSN leaves pgx's statement cache at. A connection holds
+	// one prepared append per log it has touched, so a run with more logs than
+	// this — or with the cache off — measures re-preparation rather than the
+	// log, and says so before it starts.
+	cache int
 }
 
 func main() {
-	err := run(context.Background(), os.Args[1:])
-	switch {
-	case errors.Is(err, flag.ErrHelp):
-		return
-	case err != nil:
+	// ErrHelp is -h: the usage has been printed and there is nothing to report.
+	if err := run(context.Background(), os.Args[1:]); err != nil && !errors.Is(err, flag.ErrHelp) {
 		fmt.Fprintf(os.Stderr, "pgnotch-load: %v\n", err)
 		os.Exit(1)
 	}
@@ -176,6 +174,11 @@ func parseFlags(args []string) (*config, error) {
 	if cfg.conns == 0 {
 		cfg.conns = cfg.logs + 1
 	}
+	if cfg.epoch == 0 {
+		// Unix seconds: strictly greater on each run, which is what fencing
+		// asks of whoever hands epochs out, without a counter to keep anywhere.
+		cfg.epoch = uint64(time.Now().Unix())
+	}
 	return cfg, nil
 }
 
@@ -184,6 +187,7 @@ func openPool(ctx context.Context, cfg *config) (*pgxpool.Pool, error) {
 	if err != nil {
 		return nil, fmt.Errorf("the DSN is not one pgx accepts: %w", err)
 	}
+	cfg.cache = poolCfg.ConnConfig.StatementCacheCapacity
 	poolCfg.MaxConns = int32(cfg.conns)
 	poolCfg.MinConns = int32(cfg.conns)
 	if cfg.schema != "" {
@@ -238,12 +242,6 @@ func prepare(ctx context.Context, pool *pgxpool.Pool, cfg *config) (*pgnotch.Sto
 // cannot own its logs fails having written nothing.
 func drive(ctx context.Context, store *pgnotch.Store, ids []pgnotch.LogID, cfg *config) error {
 	epoch := pgnotch.Epoch(cfg.epoch)
-	if epoch == 0 {
-		// Unix seconds: strictly greater on each run, which is what fencing
-		// asks of whoever hands epochs out, without a counter to keep anywhere.
-		epoch = pgnotch.Epoch(time.Now().Unix())
-	}
-
 	corpus, err := newCorpus(cfg.sizes.largest())
 	if err != nil {
 		return err
@@ -261,7 +259,7 @@ func drive(ctx context.Context, store *pgnotch.Store, ids []pgnotch.LogID, cfg *
 			return err
 		}
 	}
-	fmt.Println(plan(cfg, epoch, writers))
+	fmt.Println(plan(cfg, writers))
 
 	// A writer that returns an error ends the run: the two it can return —
 	// the log lost to another epoch, and a refusal the contract does not admit
@@ -272,11 +270,15 @@ func drive(ctx context.Context, store *pgnotch.Store, ids []pgnotch.LogID, cfg *
 	start := time.Now()
 	var wg sync.WaitGroup
 	failures := make(chan error, len(writers))
-	for _, w := range writers {
+	// A writer's share of the interval apart, so the slots interleave rather
+	// than every log appending at once and queuing behind itself — which would
+	// land in the reported latency as the database's.
+	spread := cfg.interval / time.Duration(len(writers))
+	for i, w := range writers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := w.run(ctx, start); err != nil {
+			if err := w.run(ctx, start.Add(time.Duration(i)*spread)); err != nil {
 				failures <- err
 				cancel()
 			}
@@ -291,10 +293,7 @@ func drive(ctx context.Context, store *pgnotch.Store, ids []pgnotch.LogID, cfg *
 	fmt.Println(total.line(time.Since(start), time.Since(start)))
 
 	close(failures)
-	if err := <-failures; err != nil {
-		return err
-	}
-	return nil
+	return <-failures
 }
 
 // report prints a line per interval until the run ends, each line covering the
@@ -319,10 +318,10 @@ func report(ctx context.Context, c *counters, cfg *config, start time.Time) {
 // plan is what the run is about to ask of the database, printed before it does:
 // the rates a reader would otherwise have to recompute from the flags, and the
 // two ways a configuration quietly measures something else.
-func plan(cfg *config, epoch pgnotch.Epoch, writers []*writer) string {
+func plan(cfg *config, writers []*writer) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%d logs at epoch %d, %g appends/s × %d entries = %g entries/s, ~%s/s\n",
-		len(writers), epoch, cfg.rps, cfg.batch, cfg.rps*float64(cfg.batch),
+		len(writers), cfg.epoch, cfg.rps, cfg.batch, cfg.rps*float64(cfg.batch),
 		humanBytes(uint64(cfg.rps*float64(cfg.batch)*cfg.sizes.mean())))
 	fmt.Fprintf(&b, "sizes %s, mean %s, %.0f%% over the %d-byte chunk\n",
 		cfg.sizes, humanBytes(uint64(cfg.sizes.mean())), 100*cfg.sizes.chunked(), pgnotch.MaxEntryChunk)
@@ -336,9 +335,12 @@ func plan(cfg *config, epoch pgnotch.Epoch, writers []*writer) string {
 			fmt.Fprintf(&b, "%s continues at seqno %d\n", w.id, w.next)
 		}
 	}
-	if len(writers) > statementCache {
-		fmt.Fprintf(&b, "warning: %d logs is over pgx's %d prepared statements, so appends will re-prepare\n",
-			len(writers), statementCache)
+	switch {
+	case cfg.cache <= 0:
+		fmt.Fprintf(&b, "warning: the DSN turns the statement cache off, so every append re-prepares\n")
+	case len(writers) > cfg.cache:
+		fmt.Fprintf(&b, "warning: %d logs is over the DSN's %d prepared statements, so appends will re-prepare\n",
+			len(writers), cfg.cache)
 	}
 	return strings.TrimRight(b.String(), "\n")
 }
