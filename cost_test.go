@@ -14,44 +14,29 @@ import (
 	"github.com/aromanovich/pgnotch"
 )
 
-// The two guards below are the reason this package exists at all. Everything
-// else about it says the log is correct and says nothing about what it costs,
-// and a log on PostgreSQL that is merely correct is a log nobody would choose:
-// what makes this one worth having is that an append writes little and waits
-// once. Both were written by breaking the implementation on purpose and
-// watching them go red.
-
-// TestAppendsWriteFewFullPageImages is the guard for what an append writes,
-// against the catalogue and the server's own counters rather than against the
-// code. Two claims:
+// TestAppendsWriteFewFullPageImages asserts two things about what an append
+// writes, against the catalogue and the server's own counters:
 //
-//  1. the entry tables have no TOAST relation, so a payload can never be
-//     moved out of line into a second table with a btree under it. That is what
-//     `bytea STORAGE PLAIN` is for, and nothing else here would notice it
-//     stopping;
+//  1. the entry tables have no TOAST relation, so `bytea STORAGE PLAIN` is
+//     keeping payloads in line rather than in a second table with a btree under
+//     it, and nothing else here would notice it stopping;
 //  2. full-page images cost a constant per checkpoint rather than a rate per
-//     entry. An append-only table touches only the page it is filling, so one
+//     entry: an append-only table touches only the page it is filling, so a
 //     checkpoint costs an image of that page and of its free-space map page,
 //     and every entry after that costs none.
 //
-// The second is measured twice, and the second measurement is what makes the
-// first mean anything: a batch must cost far fewer images than it has entries,
-// *and* one append per checkpoint must cost images — because a guard whose
-// instrument cannot see an image would report the good number whatever the
-// implementation did.
-//
-// This is also why `fillfactor = 10` is not in the schema. It was there to
-// force one row per page, and with it REGBUF_WILL_INIT; measured here, it moved
-// the image from the heap page to the free-space map page at the same rate,
-// while costing eight times the space for a 900-byte entry. Putting it back
-// makes the assertion below no greener, and the space it costs is invisible to
-// every other test here.
+// `fillfactor = 10` is not in the schema for a measured reason: it forced one
+// row per page, and with it REGBUF_WILL_INIT, but only moved the image from the
+// heap page to the free-space map page at the same rate, while costing eight
+// times the space for a 900-byte entry. Nothing goes red if it is put back —
+// the assertions below are no greener with it and the space it costs is
+// invisible to every other test here.
 func TestAppendsWriteFewFullPageImages(t *testing.T) {
 	ctx := testContext(t, 2*time.Minute)
 
-	// One connection, so that every statement below runs in the same backend as
-	// the appends: the WAL counters are accumulated per backend and published
-	// only when that backend is asked to flush them.
+	// One connection, so every statement below runs in the same backend as the
+	// appends: WAL counters accumulate per backend and are published only when
+	// that backend is asked to flush them.
 	schema := newSchema()
 	store, pool := openStoreIn(t, schema, func(config *pgxpool.Config) { config.MaxConns = 1 })
 
@@ -61,8 +46,7 @@ func TestAppendsWriteFewFullPageImages(t *testing.T) {
 	require.NoError(t, store.Fence(ctx, id, epoch))
 
 	// 900 bytes is the end of the distribution where a page holds several
-	// entries — the case where images could still turn out to be paid per entry
-	// rather than per checkpoint.
+	// entries — where images could still be paid per entry, not per checkpoint.
 	const rows = 512
 	payload := make([]byte, 900)
 	batch := make([][]byte, rows)
@@ -79,16 +63,14 @@ func TestAppendsWriteFewFullPageImages(t *testing.T) {
 		"%s has a toast relation (%d), so a large payload can be moved out of line into a table "+
 			"with a btree under it — the STORAGE PLAIN clause is not doing its job", table, toast)
 
-	// The claim: a batch after a checkpoint pays for the page it fills, not for
-	// its entries.
+	// The claim: a batch after a checkpoint pays for its page, not its entries.
 	checkpoint(ctx, t, pool)
 	before := walImages(ctx, t, pool)
 	require.NoError(t, store.Append(ctx, id, epoch, pgnotch.FirstSeqno+rows, batch))
 	batchImages := walImages(ctx, t, pool) - before
 
-	// The instrument: one append per checkpoint is the shape that does pay an
-	// image every time, and a zero here would mean the number above proves
-	// nothing.
+	// The instrument: one append per checkpoint does pay an image every time, so
+	// a zero here would mean the batch's number proves nothing.
 	const rounds = 6
 	var perCheckpointImages int64
 	for round := range pgnotch.Seqno(rounds) {
@@ -115,8 +97,8 @@ func checkpoint(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {
 }
 
 // walImages reads the cluster's full-page-image counter, having first told this
-// backend to publish what it has accumulated: without the flush the counter lags
-// and a measurement reads its own past.
+// backend to publish what it has accumulated: without the flush a measurement
+// reads its own past.
 func walImages(ctx context.Context, t *testing.T, pool *pgxpool.Pool) int64 {
 	t.Helper()
 	_, err := pool.Exec(ctx, `SELECT pg_stat_force_next_flush()`)
@@ -127,12 +109,10 @@ func walImages(ctx context.Context, t *testing.T, pool *pgxpool.Pool) int64 {
 }
 
 // entryTableIn finds the half of the ring the appends went to, in a schema
-// holding exactly one log that has not rotated.
-//
-// The schema is named rather than left to `current_schema()`, and that is not
-// tidiness: every run's tables carry names of the same shape, so a query that
-// does not pin the schema can match another run's table and assert that
-// table's options — which stays green with STORAGE PLAIN deleted.
+// holding exactly one log that has not rotated. The schema is pinned rather than
+// left to `current_schema()`: every run's tables carry the same name shape, so
+// an unpinned query can match another run's table, which stays green with
+// STORAGE PLAIN deleted.
 func entryTableIn(ctx context.Context, t *testing.T, pool *pgxpool.Pool, schema string) string {
 	t.Helper()
 	var name string
@@ -144,22 +124,16 @@ func entryTableIn(ctx context.Context, t *testing.T, pool *pgxpool.Pool, schema 
 	return name
 }
 
-// TestAppendsCostOneRoundTrip is the guard for what an append waits for.
+// TestAppendsCostOneRoundTrip guards that an append is one statement — the
+// registry row's UPDATE and the entry rows in one CTE — rather than a
+// transaction around several: a BEGIN, an UPDATE, the rows and a COMMIT are four
+// waits for the network and four times as long holding the row every writer of
+// that log contends for. It is counted at the socket rather than through pgx,
+// whose own view would count a statement it pipelines the same as one it does
+// not.
 //
-// An append is one statement — the registry row's UPDATE and the entry rows in
-// one CTE — rather than a transaction around several, and the reason is
-// latency: a BEGIN, an UPDATE, the rows and a COMMIT are four waits for the
-// network and four times as long holding the row every writer of that log
-// contends for. Nothing about that is visible in a result, which is why it is
-// asserted here and against the socket rather than against the driver: what a
-// caller waits for is writes followed by reads, and pgx's own view would count
-// a statement it pipelines the same as one it does not.
-//
-// The measurement is a pair, for the reason the images guard measures a pair.
-// The claim is the second append; the first is the instrument, because it costs
-// the extra round trip of preparing a statement the connection has not seen —
-// and a counter that cannot see that one would report the good number whatever
-// the implementation did.
+// The claim is the second append; the first is the instrument, because it pays
+// the extra round trip of preparing a statement the connection has not seen.
 func TestAppendsCostOneRoundTrip(t *testing.T) {
 	ctx := testContext(t, time.Minute)
 
@@ -194,19 +168,12 @@ func TestAppendsCostOneRoundTrip(t *testing.T) {
 // TestAppendsStayOneRoundTripAcrossLogs bounds the claim above, which is true
 // of one log and not automatically true of a thousand.
 //
-// An append names its log's tables, so its statement text is that log's alone
-// and a connection holds one per log it has touched. pgx caches those on the
-// server and evicts by LRU at a capacity of 512 by default, so a connection
-// round-robining across more logs than the cache holds misses on every append:
-// the statement is prepared again, the evicted one deallocated, and the single
-// round trip becomes three. At 1024 logs that is measured — three round trips
-// and 1985 bytes an append against one and 1151 with the cache sized for the
-// log count — and the fix is the DSN rather than this package, which is exactly
-// why it needs saying somewhere a reader will find it.
+// A connection round-robining across more logs than its statement cache holds
+// misses on every append, and the single round trip becomes three. The fix is
+// the DSN rather than this package.
 //
-// The sizes here are small on purpose: what decides the outcome is the ratio of
-// logs to capacity, so eight and four reproduce at millisecond cost what a
-// thousand and 512 do.
+// What decides the outcome is the ratio of logs to capacity, so eight and four
+// reproduce at millisecond cost what a thousand and 512 do.
 func TestAppendsStayOneRoundTripAcrossLogs(t *testing.T) {
 	const logs = 8
 	const starvedCache = 4
@@ -225,8 +192,7 @@ func TestAppendsStayOneRoundTripAcrossLogs(t *testing.T) {
 
 // appendRoundTrips is the round trips one steady-state append costs on a
 // connection whose statement cache holds capacity statements, round-robining
-// across logs. The first pass over them is discarded: it is the one that fills
-// the cache.
+// across logs. The first pass over them is discarded: it fills the cache.
 func appendRoundTrips(t *testing.T, logs, capacity int) int64 {
 	t.Helper()
 	ctx := testContext(t, time.Minute)
@@ -253,10 +219,9 @@ func appendRoundTrips(t *testing.T, logs, capacity int) int64 {
 	return (trips.Load() - before) / int64(logs)
 }
 
-// countingPool tunes a pool so that its round trips land in trips: one
-// connection, so that everything counted is the caller's, and a dialer that
-// wraps the socket. A capacity of zero leaves the driver's statement cache at
-// its default.
+// countingPool tunes a pool so that its round trips land in trips, over a single
+// connection so that everything counted is the caller's. A capacity of zero
+// leaves the driver's statement cache at its default.
 func countingPool(trips *atomic.Int64, capacity int) func(*pgxpool.Config) {
 	return func(config *pgxpool.Config) {
 		config.MaxConns = 1
@@ -275,13 +240,11 @@ func countingPool(trips *atomic.Int64, capacity int) func(*pgxpool.Config) {
 
 // countingConn counts round trips: a read that follows a write is a wait for
 // the server, and reads that follow reads are the rest of one answer arriving.
-//
-// It sits under pgx's own buffering deliberately. The driver decides how many
-// protocol messages to put in a flush, and it is the flush a caller waits for.
+// It sits under pgx's own buffering, because the driver decides how many
+// protocol messages go into a flush and it is the flush a caller waits for.
 //
 // wrote is per connection and trips is per measurement, which is why only the
-// second is a pointer: two connections counting into one total is meaningful,
-// two sharing one half-written flag is not.
+// second is a pointer.
 type countingConn struct {
 	net.Conn
 	trips *atomic.Int64

@@ -9,9 +9,7 @@ import (
 
 // The rules below are pure functions of values, and this file is the only place
 // they are reachable: every other test here drives a live PostgreSQL, which
-// takes one path of each per test. What is stated here is the rest — the
-// ranking between two refusals that both apply, the boundary either side of a
-// chunk, the ring's arithmetic at zero.
+// takes one path of each per test.
 
 // TestAppendRefusalRanksFencedFirst is the promise [Store.Append] documents:
 // where more than one refusal applies, [ErrFenced] wins, because
@@ -78,9 +76,9 @@ func TestFenceRefusalAdmitsTheSameEpochTwice(t *testing.T) {
 	}
 }
 
-// TestChunksOfSplitsAtThePageBoundary pins what keeps a row inside a page: a
-// row above the ceiling is refused by PostgreSQL rather than moved out of line,
-// which is what `bytea STORAGE PLAIN` buys and costs.
+// TestChunksOfSplitsAtThePageBoundary pins what keeps a row inside a page: with
+// `bytea STORAGE PLAIN` a row above the ceiling is refused by PostgreSQL rather
+// than moved out of line.
 func TestChunksOfSplitsAtThePageBoundary(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -110,17 +108,16 @@ func TestChunksOfSplitsAtThePageBoundary(t *testing.T) {
 					"chunk %d is over the %d a row may hold", i, MaxEntryChunk)
 			}
 			// bytes.Equal rather than require.Equal: joining one empty chunk
-			// gives nil, and nil against empty is not a difference chunking
-			// promises either way.
+			// gives nil, which is not a difference from empty.
 			require.True(t, bytes.Equal(payload, bytes.Join(parts, nil)),
 				"the payload did not survive the split")
 		})
 	}
 }
 
-// TestChunkArraysNumbersEveryRow is the other half of the split. An entry above
-// one chunk must not shift the seqno of the entry after it, and chunk indexes
-// restart per entry — [Store.ReadFrom] reassembles on exactly those two facts.
+// TestChunkArraysNumbersEveryRow: an entry above one chunk must not shift the
+// seqno of the entry after it, and chunk indexes restart per entry —
+// [Store.ReadFrom] reassembles on exactly those two facts.
 func TestChunkArraysNumbersEveryRow(t *testing.T) {
 	seqnos, chunks, parts := chunkArrays(10, [][]byte{
 		make([]byte, 5),
@@ -135,8 +132,8 @@ func TestChunkArraysNumbersEveryRow(t *testing.T) {
 
 // TestRingFullCountsFromTheHalfsOwnStart matters most at zero: a log nobody has
 // appended to has last_seqno 0 against cur_lo 1, so the subtraction runs
-// backwards through the unsigned range before the +1 brings it to zero. Right
-// by two's complement rather than by anything a reader can see.
+// backwards through the unsigned range before the +1 brings it to zero. Right by
+// two's complement, and by nothing a reader can see.
 func TestRingFullCountsFromTheHalfsOwnStart(t *testing.T) {
 	cases := []struct {
 		name string
@@ -174,9 +171,8 @@ func TestPrevEmptyNeedsAnOtherHalfToEmpty(t *testing.T) {
 	}
 }
 
-// TestCanRotateNeedsTheOtherHalfEmptied is the guard on the turn itself:
-// prev_hi = 0 is the only record that the half about to become current holds
-// nothing.
+// TestCanRotateNeedsTheOtherHalfEmptied: prev_hi = 0 is the only record that the
+// half about to become current holds nothing.
 func TestCanRotateNeedsTheOtherHalfEmptied(t *testing.T) {
 	full := Seqno(rotateAfterEntries)
 	require.True(t, logState{lastSeqno: full, curLo: FirstSeqno, prevHi: 0}.canRotate())
@@ -185,13 +181,13 @@ func TestCanRotateNeedsTheOtherHalfEmptied(t *testing.T) {
 }
 
 // TestReclaimStepsNeverRotatesOnAnEmptyingThatDidNotHappen covers the wiring a
-// driver test cannot reach: it would take one trim advancing the watermark
-// between another trim's read and that trim's transaction.
+// driver test cannot reach: one trim advancing the watermark between another
+// trim's read and that trim's transaction.
 //
 // The last row is the one that matters. Without the tables locked there is no
 // truncate, and without the truncate there must be no turn — the entries it
-// would write over are all below the trim watermark, so every read of them is
-// filtered out and nothing downstream would ever say so.
+// would write over are all below the trim watermark, so every read filters them
+// out and nothing downstream would ever say so.
 func TestReclaimStepsNeverRotatesOnAnEmptyingThatDidNotHappen(t *testing.T) {
 	full := Seqno(rotateAfterEntries)
 	cases := []struct {

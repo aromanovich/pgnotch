@@ -1,15 +1,10 @@
 #!/bin/bash
 # Bring up a single-node PostgreSQL for this package's suite.
 #
-# The image is pulled rather than built: the upstream postgres images are
-# multi-architecture, so the host's own architecture runs natively and there is
-# no emulation on this path and no Dockerfile to maintain.
-#
-# The major version is not free to choose. The entry tables declare their
-# payload column `bytea STORAGE PLAIN`, which is what keeps a TOAST relation
-# from ever being created, and per-column STORAGE inside CREATE TABLE is a
-# syntax error before PostgreSQL 16. The check below fails loudly rather than
-# letting the suite discover it as a parse error at CreateLogs time.
+# The major version is not free to choose: the entry tables declare their
+# payload column `bytea STORAGE PLAIN` to keep a TOAST relation from ever being
+# created, and per-column STORAGE inside CREATE TABLE is a syntax error before
+# PostgreSQL 16. The check below fails loudly rather than at CreateLogs time.
 set -eu -o pipefail
 
 NAME="${NAME:-pgnotch-pg}"
@@ -19,10 +14,9 @@ PG_USER="${PG_USER:-pgnotch}"
 PG_PASSWORD="${PG_PASSWORD:-pgnotch}"
 PG_DATABASE="${PG_DATABASE:-pgnotch}"
 
-# Poll until `probe` prints something containing `marker`, giving up after two
-# minutes. The probe's output is captured rather than piped into `grep -q`: grep
-# exits on the first match and SIGPIPEs the writer, which under `set -o pipefail`
-# would mark the check failed even when the marker is there.
+# Poll until the probe prints something containing `marker`, giving up after two
+# minutes. The output is captured rather than piped into `grep -q`, which exits
+# on the first match and SIGPIPEs the writer — a failure under `set -o pipefail`.
 wait_for() {
   local what="$1" marker="$2"; shift 2
   local output
@@ -47,8 +41,7 @@ wait_for() {
 echo "== starting $NAME ($IMAGE) =="
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 # Nothing a test writes is meant to outlive the run, so the data directory is a
-# tmpfs: this keeps the disk out of the way of a suite that exists to exercise
-# the design, not the storage.
+# tmpfs.
 docker run -d --name "$NAME" \
   -p "$PG_PORT":5432 \
   -e POSTGRES_USER="$PG_USER" \
@@ -72,7 +65,7 @@ if ! docker exec "$NAME" psql -U "$PG_USER" -d "$PG_DATABASE" -q \
   docker exec "$NAME" psql -U "$PG_USER" -d "$PG_DATABASE" -tAc "SELECT version()"
   exit 1
 fi
-# The probe also proves the point of the clause: no toast relation was created.
+# The probe also checks the point of the clause: no toast relation was created.
 toast=$(docker exec "$NAME" psql -U "$PG_USER" -d "$PG_DATABASE" -tAc \
   "SELECT reltoastrelid FROM pg_class WHERE relname = 'pgnotch_storage_probe'")
 docker exec "$NAME" psql -U "$PG_USER" -d "$PG_DATABASE" -q -c "DROP TABLE pgnotch_storage_probe"

@@ -15,24 +15,17 @@ import (
 )
 
 // envDSN names the database this package is tested against. There is no default
-// on purpose: a suite that reaches a database somebody did not name is one that
-// can truncate tables somebody cared about.
+// on purpose: a suite that reaches a database somebody did not name can truncate
+// tables somebody cared about.
 const envDSN = "PGNOTCH_DSN"
 
-// TestMain refuses to run this package's tests at all without a database, and
-// that is the whole of the policy: there is no configuration in which
-// `go test ./...` is green having never spoken to PostgreSQL.
+// TestMain refuses to run this package's tests at all without a database: there
+// is no configuration in which `go test ./...` is green having never spoken to
+// PostgreSQL.
 //
-// It replaces a skip. A skip is how a suite reports "asserted nothing" in the
-// same colour it reports "asserted everything", and this package is a claim
-// about PostgreSQL's behaviour — the refusal that a predicate is re-evaluated
-// after a wait, that a page bounds a row, that TRUNCATE gives space back. None
-// of that is checkable in a process, so a green run that stayed in one is not a
-// weaker result, it is a different one wearing the same colour.
-//
-// The tables in rules_test.go need no database and run anyway, under this same
-// rule: they are cases the driver tests cannot reach, not a suite of their own,
-// and letting them stand in for a run would be the skip again by another name.
+// The tables in rules_test.go need no database and run anyway, under the same
+// rule: they are cases the driver tests cannot reach, not a suite that may stand
+// in for a run.
 func TestMain(m *testing.M) {
 	if os.Getenv(envDSN) == "" {
 		fmt.Fprintf(os.Stderr,
@@ -45,9 +38,8 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// entryTablePattern matches a log's entry tables and nothing else this package
-// owns, as a LIKE pattern. The underscores are escaped because LIKE reads a
-// bare one as "any character".
+// entryTablePattern matches a log's entry tables as a LIKE pattern. The
+// underscores are escaped because LIKE reads a bare one as "any character".
 const entryTablePattern = `pgnotch\_entries\_%`
 
 // schemaCounter keeps schema names unique within one process; with the pid it
@@ -65,13 +57,11 @@ func openStore(t *testing.T) *pgnotch.Store {
 	return store
 }
 
-// openStoreIn is [openStore] over a schema the caller named and a pool it has
-// had a say in, and it hands the pool back.
-//
-// The pool is a parameter because the cost guards cannot take one as given: one
-// counts round trips and needs a DialFunc under the connection, another needs a
-// statement cache of a stated size, and the full-page-image guard needs a
-// single connection because the counters it reads are per backend.
+// openStoreIn is [openStore] over a schema the caller named, and it hands the
+// pool back. The pool is tunable because the cost guards cannot take one as
+// given: one counts round trips and needs a DialFunc under the connection,
+// another needs a statement cache of a stated size, and the full-page-image
+// guard needs a single connection because the counters it reads are per backend.
 func openStoreIn(t *testing.T, schema string, tune func(*pgxpool.Config)) (*pgnotch.Store, *pgxpool.Pool) {
 	t.Helper()
 	pool := openPoolIn(t, schema, tune)
@@ -86,10 +76,9 @@ func openStoreIn(t *testing.T, schema string, tune func(*pgxpool.Config)) (*pgno
 }
 
 // openPoolIn is a pool whose every connection resolves unqualified names in a
-// schema of this test's own, created here and dropped when the test ends.
-//
-// The schema is what keeps concurrent tests and consecutive runs out of each
-// other's tables, and it is created through this same pool: naming it in
+// schema of this test's own, created here and dropped when the test ends — which
+// is what keeps concurrent tests and consecutive runs out of each other's
+// tables. The schema can be created through this same pool because naming it in
 // `search_path` before it exists is allowed, and `CREATE SCHEMA` names its own
 // target rather than resolving one.
 func openPoolIn(t *testing.T, schema string, tune func(*pgxpool.Config)) *pgxpool.Pool {
@@ -121,9 +110,8 @@ func openPoolIn(t *testing.T, schema string, tune func(*pgxpool.Config)) *pgxpoo
 		t.Fatalf("no PostgreSQL at %s: %v\nit must be 16 or newer", dsn, err)
 	}
 
-	// Registered before anything is written: the schema's tables are the
-	// database's disk, and a test that fails part way through has to give them
-	// back too.
+	// Registered before anything is written: a test that fails part way through
+	// still owes the schema's tables back.
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cancel()
