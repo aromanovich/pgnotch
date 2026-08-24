@@ -14,7 +14,7 @@ set -eu -o pipefail
 
 NAME="${NAME:-pgnotch-pg}"
 IMAGE="${IMAGE:-postgres:18-alpine}"
-PG_PORT="${PG_PORT:-5433}"
+PG_PORT="${PG_PORT:-5432}"
 PG_USER="${PG_USER:-pgnotch}"
 PG_PASSWORD="${PG_PASSWORD:-pgnotch}"
 PG_DATABASE="${PG_DATABASE:-pgnotch}"

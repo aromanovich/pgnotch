@@ -3,10 +3,9 @@
 # The database the suite talks to. The tests themselves have no default — one
 # that reached a database nobody named could truncate tables somebody cared
 # about — so the default is here, where it names the container `make pg-up`
-# starts and nothing else. Point PGNOTCH_DSN at your own to use it instead; it
-# must be PostgreSQL 16 or newer, which is what pg-up.sh checks by probing
-# `bytea STORAGE PLAIN`.
-PG_PORT ?= 5433
+# starts and nothing else. Point PGNOTCH_DSN at your own to use it instead; the
+# version floor and the probe that enforces it are pg-up.sh's.
+PG_PORT ?= 5432
 PG_USER ?= pgnotch
 PG_PASSWORD ?= pgnotch
 PG_DATABASE ?= pgnotch
