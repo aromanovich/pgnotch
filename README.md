@@ -48,9 +48,16 @@ if err := store.Fence(ctx, shipments, epoch); err != nil {
     return err
 }
 
+// Ask where the next append goes: the log you have just fenced may be one
+// somebody else was writing, and this is what hands that over.
+next, err := store.NextSeqno(ctx, shipments)
+if err != nil {
+    return err
+}
+
 // Append at consecutive seqnos. Returning nil means every entry up to the
 // batch's last is durable.
-err = store.Append(ctx, shipments, epoch, pgnotch.FirstSeqno, [][]byte{
+err = store.Append(ctx, shipments, epoch, next, [][]byte{
     []byte("first"),
     []byte("second"),
 })
@@ -66,17 +73,21 @@ case err != nil:
 
 // The next batch starts where this one ended: seqnos are always the caller's
 // to assign, and there is no "append at the end". The owner keeps its own
-// high-water mark; the three outcomes above are this call's as well.
-err = store.Append(ctx, shipments, epoch, pgnotch.FirstSeqno+2, [][]byte{
+// high-water mark from here and does not ask again; the three outcomes above
+// are this call's as well.
+err = store.Append(ctx, shipments, epoch, next+2, [][]byte{
     []byte("third"),
 })
 
 entries, err := store.ReadFrom(ctx, shipments, pgnotch.FirstSeqno, 100)
 ```
 
-A writer that has just fenced a log somebody else wrote does not have that mark
-and there is no call that hands it over: it reads for it, `ReadFrom` until a
-short read, and appends at the last entry's seqno plus one. A replay after an
+A writer that has just fenced a log somebody else wrote does not have that
+mark, and `NextSeqno` hands over where the next append goes: one registry row
+by primary key. It is kept there rather than derived from the entries, so it is
+right for a log a trim has emptied — where reading the log for it would find
+nothing and start again at the first seqno. Ask once on taking the log and
+track it from there; an append does not need to ask. A replay after an
 ambiguous append is the other case that looks like a new seqno and is not —
 resend *the same* batch at the same seqno and read `ErrAlreadyWritten` as the
 ack.
@@ -98,6 +109,8 @@ arrived there) and [`pgx/v5`](https://github.com/jackc/pgx).
    in the middle.
 5. **Readback.** `ReadFrom` returns every entry a completed append acked and no
    trim has removed, in seqno order — across a change of owner included.
+6. **Handover.** `NextSeqno` names the seqno a new owner's first append must
+   start at — for a log whose entries a trim has all taken included.
 
 Payloads are opaque bytes. Nothing here interprets, compresses or frames them,
 and nothing here decides what a log is *for*.
@@ -373,8 +386,9 @@ Three things follow from what a log is, rather than from the tool:
 * **it trims behind itself**, which is what makes an unbounded run cost a
   bounded amount of disk. `-retain 0` turns that off and the tables then grow
   for as long as it runs;
-* **it picks up where it left off.** A restart reads each log for its mark the
-  way any new owner has to, and says which seqno it continues at.
+* **it picks up where it left off.** A restart asks each log where its next
+  append goes, the way any new owner has to, and says which seqno it continues
+  at.
 
 The rate is a schedule fixed when the run starts, not a sleep between appends,
 so a slow round trip is repaid out of the slots after it rather than lowering

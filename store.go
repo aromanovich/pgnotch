@@ -397,6 +397,32 @@ func (s *Store) ReadFrom(ctx context.Context, id LogID, from Seqno, limit int) (
 	return entries, nil
 }
 
+// NextSeqno is the seqno the log's next append must start at: one past its last
+// entry, and [FirstSeqno] for a log nothing has appended to. A log that does not
+// exist is [ErrNoSuchLog]. It is the registry row's and is not derived from the
+// entries, so it is right for a log a trim has emptied.
+//
+// A new owner asks once and keeps the mark itself from there: the log's end
+// after an [Store.Append] is that batch's last seqno, and asking again per
+// append would put a second round trip on the one call that has only one.
+//
+// It answers for the log only while the caller owns it — an append by a higher
+// epoch moves it — which is not a race to lose: appending at a stale value is
+// refused rather than misplaced.
+func (s *Store) NextSeqno(ctx context.Context, id LogID) (Seqno, error) {
+	if err := checkLogID(id); err != nil {
+		return 0, err
+	}
+	st, found, err := s.readState(ctx, id)
+	if err != nil {
+		return 0, err
+	}
+	if !found {
+		return 0, fmt.Errorf("%w: %q", ErrNoSuchLog, id)
+	}
+	return st.lastSeqno + 1, nil
+}
+
 // Trim removes the log's entries at or below upTo. Trimming entries that are
 // not there is not an error: Trim states where the log should start, and
 // repeating it is harmless. The log stays appendable at the next seqno,
@@ -446,7 +472,7 @@ func (s *Store) readState(ctx context.Context, id LogID) (logState, bool, error)
 		return logState{}, false, fmt.Errorf("pgnotch: reading the state of %q: %w", id, err)
 	}
 	// The ordinal is here and immutable, so a writer that has just fenced and
-	// read to the tail pays no lookup for its first append.
+	// asked where the log ends pays no lookup for its first append.
 	s.remember(id, st.ordinal)
 	return st, true, nil
 }

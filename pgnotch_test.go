@@ -128,9 +128,15 @@ func TestAFenceReachesAnotherStore(t *testing.T) {
 	require.ErrorIs(t, err, pgnotch.ErrFenced,
 		"the ex-owner, which nobody told, appended at the epoch it still believes it holds")
 
+	// The successor holds no mark of its own and asks the log for one, which is
+	// what NextSeqno is for: a fence takes ownership and moves nothing else.
+	next, err := successor.NextSeqno(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, pgnotch.FirstSeqno+1, next)
+
 	// The successor inherits the log rather than starting one: it reads what the
 	// incumbent was acked for and nothing the zombie wrote.
-	require.NoError(t, successor.Append(ctx, id, taken, pgnotch.FirstSeqno+1,
+	require.NoError(t, successor.Append(ctx, id, taken, next,
 		[][]byte{[]byte("the successor's entry")}))
 	entries, err := successor.ReadFrom(ctx, id, pgnotch.FirstSeqno, 10)
 	require.NoError(t, err)
@@ -270,6 +276,8 @@ func TestFencingALogNobodyCreatedMakesNoTables(t *testing.T) {
 	for _, id := range []pgnotch.LogID{"typo", "tenant/../etc", "999999"} {
 		err := store.Fence(ctx, id, 1)
 		require.ErrorIsf(t, err, pgnotch.ErrNoSuchLog, "fencing %q", id)
+		_, err = store.NextSeqno(ctx, id)
+		require.ErrorIsf(t, err, pgnotch.ErrNoSuchLog, "the next seqno of %q", id)
 	}
 	require.Equalf(t, before, tablesLike(ctx, t, pool, schema, entryTablePattern),
 		"a refused fence left entry tables behind, so a bad id is a table nobody asked for")
@@ -341,6 +349,56 @@ func TestTrimOfALogThatHeldNothingLeavesItAppendable(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, entries, 1, "the entry appended after the trim is hidden by the trim's watermark")
 	require.Equal(t, []byte("after the trim"), entries[0].Payload)
+}
+
+func TestTheNextSeqnoIsWhereAnAppendMustGo(t *testing.T) {
+	store := openStore(t)
+	ctx := testContext(t, time.Minute)
+
+	const id = pgnotch.LogID("where-next")
+	const epoch = pgnotch.Epoch(1)
+	require.NoError(t, store.CreateLogs(ctx, id))
+	require.NoError(t, store.Fence(ctx, id, epoch))
+
+	next, err := store.NextSeqno(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, pgnotch.FirstSeqno, next, "a log nothing has appended to starts at the first seqno")
+
+	require.NoError(t, store.Append(ctx, id, epoch, next, [][]byte{[]byte("a"), []byte("b")}))
+	next, err = store.NextSeqno(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, pgnotch.FirstSeqno+2, next)
+
+	// It took no mark from the append it just made, so it is the whole of what a
+	// writer needs to go on appending.
+	require.NoError(t, store.Append(ctx, id, epoch, next, [][]byte{[]byte("c")}))
+}
+
+// TestTheNextSeqnoOutlivesTheEntries is the case a read cannot answer: a log
+// every entry of which a trim has taken reads as empty, so a successor sizing it
+// up by reading would start again at the first seqno and be refused all the way
+// back to where it should have started.
+func TestTheNextSeqnoOutlivesTheEntries(t *testing.T) {
+	store := openStore(t)
+	ctx := testContext(t, time.Minute)
+
+	const id = pgnotch.LogID("trimmed-to-the-end")
+	const epoch = pgnotch.Epoch(1)
+	require.NoError(t, store.CreateLogs(ctx, id))
+	require.NoError(t, store.Fence(ctx, id, epoch))
+	require.NoError(t, store.Append(ctx, id, epoch,
+		pgnotch.FirstSeqno, [][]byte{[]byte("a"), []byte("b"), []byte("c")}))
+	require.NoError(t, store.Trim(ctx, id, pgnotch.FirstSeqno+2))
+
+	entries, err := store.ReadFrom(ctx, id, pgnotch.FirstSeqno, 10)
+	require.NoError(t, err)
+	require.Empty(t, entries, "everything the log held has been trimmed")
+
+	next, err := store.NextSeqno(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, pgnotch.FirstSeqno+3, next)
+	require.NoError(t, store.Append(ctx, id, epoch, next, [][]byte{[]byte("d")}),
+		"the seqno it names is the one the log admits")
 }
 
 // TestAPayloadIsNobodyElsesMemory is the aliasing promise no caller can check

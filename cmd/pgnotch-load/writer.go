@@ -10,10 +10,6 @@ import (
 	"github.com/aromanovich/pgnotch"
 )
 
-// readBatch is how many entries a tail walk asks for at a time. It only runs at
-// start-up and after a refusal, so the size trades nothing worth a knob.
-const readBatch = 1024
-
 // writer is the load on one log: one goroutine appending at consecutive seqnos,
 // because a log admits one writer at a time and two concurrent appends to it
 // race for seqnos and lose. Concurrency in this tool is therefore logs, and the
@@ -28,8 +24,8 @@ type writer struct {
 
 	id    pgnotch.LogID
 	epoch pgnotch.Epoch
-	// next is where this writer's next batch starts: its own high-water mark,
-	// which nothing hands over and every owner keeps for itself.
+	// next is where this writer's next batch starts: the mark it took from the
+	// log on claiming it and has kept for itself since.
 	next pgnotch.Seqno
 	// trimmed is the seqno the last trim asked for, so the trims are one per
 	// stride rather than one per append.
@@ -45,34 +41,19 @@ func (w *writer) claim(ctx context.Context) error {
 	if err := w.store.Fence(fenceCtx, w.id, w.epoch); err != nil {
 		return err
 	}
-	next, err := w.tail(ctx, pgnotch.FirstSeqno)
+	return w.locate(ctx)
+}
+
+// locate puts the writer where the log says its next append goes.
+func (w *writer) locate(ctx context.Context) error {
+	readCtx, cancel := context.WithTimeout(ctx, w.cfg.timeout)
+	defer cancel()
+	next, err := w.store.NextSeqno(readCtx, w.id)
 	if err != nil {
 		return err
 	}
 	w.next = next
 	return nil
-}
-
-// tail is the first free seqno at or above from, read the way a new owner is
-// expected to find one: there is no call that hands the mark over, so it reads
-// until a short read. Called with [pgnotch.FirstSeqno] it walks the whole
-// retained log; called with the writer's own position it costs one read, which
-// is what a refusal needs to resynchronise.
-func (w *writer) tail(ctx context.Context, from pgnotch.Seqno) (pgnotch.Seqno, error) {
-	for {
-		readCtx, cancel := context.WithTimeout(ctx, w.cfg.timeout)
-		entries, err := w.store.ReadFrom(readCtx, w.id, from, readBatch)
-		cancel()
-		if err != nil {
-			return 0, err
-		}
-		if len(entries) > 0 {
-			from = entries[len(entries)-1].Seqno + 1
-		}
-		if len(entries) < readBatch {
-			return from, nil
-		}
-	}
 }
 
 // run appends until the context ends. It returns nil for a run that was stopped
@@ -143,15 +124,15 @@ func (w *writer) append(ctx context.Context, batch [][]byte) (done bool, err err
 		// The ack for an earlier attempt, or a mark that moved while this
 		// writer was not looking. One read says which and where to go on from.
 		w.c.acks.Add(1)
-		w.resync(ctx, w.next)
+		w.resync(ctx)
 		return false, nil
 
 	case errors.Is(err, pgnotch.ErrGap):
 		// Unreachable for a single writer appending in order, so it is read as
-		// a lost position rather than as a race: the walk starts from the
-		// bottom because a gap means this writer is above the log's end.
+		// a lost position rather than as a race: this writer is above the
+		// log's end.
 		w.c.gaps.Add(1)
-		w.resync(ctx, pgnotch.FirstSeqno)
+		w.resync(ctx)
 		return false, nil
 
 	default:
@@ -165,16 +146,13 @@ func (w *writer) append(ctx context.Context, batch [][]byte) (done bool, err err
 	}
 }
 
-// resync puts the writer back on the log's own mark. A read that fails leaves
-// the position alone: the batch goes again at the next slot, is refused again,
-// and comes back here — a retry loop paced like every other append.
-func (w *writer) resync(ctx context.Context, from pgnotch.Seqno) {
-	next, err := w.tail(ctx, from)
-	if err != nil {
+// resync is locate for a refused append. A read that fails leaves the position
+// alone: the batch goes again at the next slot, is refused again, and comes
+// back here — a retry loop paced like every other append.
+func (w *writer) resync(ctx context.Context) {
+	if err := w.locate(ctx); err != nil {
 		w.c.note(err)
-		return
 	}
-	w.next = next
 }
 
 func (w *writer) record(batch [][]byte) {
